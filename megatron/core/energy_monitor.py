@@ -62,6 +62,7 @@ class EnergyMonitor:
             return nvmlDeviceGetTotalEnergyConsumption(self._handle)
         except NVMLError:
             return self._last_energy  # return *something* if it errors
+        #return self._last_energy  # return *something* if it errors
 
     def lap(self) -> float:
         """Returns lap (iteration) energy (J) and updates total energy."""

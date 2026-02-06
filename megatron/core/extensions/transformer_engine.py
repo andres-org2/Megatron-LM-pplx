@@ -51,6 +51,8 @@ from megatron.core.utils import (
 
 try:
     import transformer_engine as te
+    import transformer_engine.pytorch as _te_pytorch
+    te.pytorch = _te_pytorch
 
     HAVE_TE = True
 except ImportError:
