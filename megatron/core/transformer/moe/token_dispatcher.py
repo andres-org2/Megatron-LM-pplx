@@ -1550,12 +1550,36 @@ class _PplxGardenManager(_DispatchManager):
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
 
+        if routing_map.dtype != torch.bool:
+            raise TypeError(
+                "pplx_garden backend expects routing_map to be a bool tensor after metadata "
+                "initialization"
+            )
+
+        routes_per_token = routing_map.sum(dim=-1)
+        if not torch.all(routes_per_token == self.router_topk):
+            unique_route_counts = torch.unique(routes_per_token).tolist()
+            raise ValueError(
+                "pplx_garden backend expects each token to route to exactly "
+                f"{self.router_topk} experts, but saw route counts {unique_route_counts}"
+            )
+
         self.token_probs = probs
         self._dispatch_weights = torch.ones(
             (num_tokens, self.router_topk), dtype=torch.float32, device=probs.device
         )
-        self.token_indices = torch.topk(probs, self.router_topk, dim=-1).indices.to(
-            torch.uint32
+        flat_token_indices = torch.arange(
+            self.num_experts, device=routing_map.device, dtype=torch.int64
+        ).expand(num_tokens, -1)
+        self.token_indices = (
+            flat_token_indices[routing_map]
+            .reshape(num_tokens, self.router_topk)
+            .to(torch.uint32)
+        )
+        selected_probs = torch.gather(
+            probs,
+            dim=-1,
+            index=self.token_indices.to(torch.int64),
         )
         _pplx_debug_log(
             "setup metadata "
@@ -1563,7 +1587,15 @@ class _PplxGardenManager(_DispatchManager):
             f"token_indices_shape={tuple(self.token_indices.shape)} router_topk={self.router_topk} "
             f"num_experts={self.num_experts} "
             f"token_indices_min={int(self.token_indices.min().item())} "
-            f"token_indices_max={int(self.token_indices.max().item())}"
+            f"token_indices_max={int(self.token_indices.max().item())} "
+            f"routes_per_token_unique={torch.unique(routes_per_token).tolist()} "
+            f"selected_probs_min={float(selected_probs.min().item()):.6f} "
+            f"selected_probs_max={float(selected_probs.max().item()):.6f}"
+        )
+        _pplx_debug_log(
+            "setup metadata sample "
+            f"token_indices_sample={self.token_indices[:4].tolist()} "
+            f"selected_probs_sample={selected_probs[:4].tolist()}"
         )
 
         local_expert_start = self.rank * self.num_local_experts
