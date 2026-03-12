@@ -44,8 +44,14 @@ def pytest_sessionfinish(session, exitstatus):
 def cleanup():
     yield
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-        torch.distributed.destroy_process_group()
+        try:
+            torch.distributed.barrier()
+        except Exception:
+            pass
+        try:
+            torch.distributed.destroy_process_group()
+        except Exception:
+            pass
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -77,9 +83,16 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
 def ensure_test_data():
     """Ensure test data is available at /opt/data by downloading if necessary."""
     data_path = Path("/opt/data")
+    data_path.mkdir(parents=True, exist_ok=True)
+    rank = int(os.environ.get("RANK", "0"))
 
     # Check if data directory exists and has content
     if not data_path.exists() or not any(data_path.iterdir()):
+        if rank != 0:
+            print(
+                "Test data not found at /opt/data. Skipping download on non-zero rank"
+            )
+            return
         print("Test data not found at /opt/data. Downloading...")
 
         try:

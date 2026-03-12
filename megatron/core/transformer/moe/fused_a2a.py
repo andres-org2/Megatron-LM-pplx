@@ -155,8 +155,11 @@ def _get_pplx_group_metadata(group: torch.distributed.ProcessGroup):
 
 
 @internal_api
-def make_pplx_process_group_adapters(group: torch.distributed.ProcessGroup):
-    """Create global and node-local pplx-garden adapters for a TPxEP group."""
+def make_pplx_process_group_adapters(
+    global_group: torch.distributed.ProcessGroup,
+    dp_group: torch.distributed.ProcessGroup,
+):
+    """Create pplx-garden adapters for the TPxEP global group and TP shared-token group."""
 
     if not HAVE_PPLX_GARDEN:
         raise ImportError(
@@ -164,41 +167,54 @@ def make_pplx_process_group_adapters(group: torch.distributed.ProcessGroup):
             "pplx_garden flex MoE backend."
         )
 
-    ranks, node_ranks, node_rank_groups, node_meta = _get_pplx_group_metadata(group)
-    global_group = _TorchProcessGroupAdapter(
-        device_group=group,
-        command_group=_get_or_create_process_group(ranks, backend="gloo"),
-        ranks=ranks,
+    global_ranks, node_ranks, node_rank_groups, node_meta = _get_pplx_group_metadata(
+        global_group
+    )
+    dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+
+    global_group_adapter = _TorchProcessGroupAdapter(
+        device_group=global_group,
+        command_group=_get_or_create_process_group(global_ranks, backend="gloo"),
+        ranks=global_ranks,
+        node_meta=node_meta,
+    )
+    dp_group_adapter = _TorchProcessGroupAdapter(
+        device_group=dp_group,
+        command_group=_get_or_create_process_group(dp_ranks, backend="gloo"),
+        ranks=dp_ranks,
         node_meta=node_meta,
     )
 
-    node_device_group = None
-    node_command_group = None
-    current_rank = torch.distributed.get_rank()
-    for candidate_ranks in node_rank_groups:
-        candidate_device_group = _get_or_create_process_group(
-            candidate_ranks, backend="nccl"
-        )
-        candidate_command_group = _get_or_create_process_group(
-            candidate_ranks, backend="gloo"
-        )
-        if current_rank in candidate_ranks:
-            node_device_group = candidate_device_group
-            node_command_group = candidate_command_group
+    node_group_adapter = None
+    if node_meta["num_nodes"] > 1:
+        node_device_group = None
+        node_command_group = None
+        current_rank = torch.distributed.get_rank()
+        for candidate_ranks in node_rank_groups:
+            candidate_device_group = _get_or_create_process_group(
+                candidate_ranks, backend="nccl"
+            )
+            candidate_command_group = _get_or_create_process_group(
+                candidate_ranks, backend="gloo"
+            )
+            if current_rank in candidate_ranks:
+                node_device_group = candidate_device_group
+                node_command_group = candidate_command_group
 
-    assert node_device_group is not None, (
-        "Failed to construct node-local pplx process group"
-    )
-    assert node_command_group is not None, (
-        "Failed to construct node-local pplx process group"
-    )
-    node_group = _TorchProcessGroupAdapter(
-        device_group=node_device_group,
-        command_group=node_command_group,
-        ranks=node_ranks,
-        node_meta=node_meta,
-    )
-    return global_group, node_group
+        assert node_device_group is not None, (
+            "Failed to construct node-local pplx process group"
+        )
+        assert node_command_group is not None, (
+            "Failed to construct node-local pplx process group"
+        )
+        node_group_adapter = _TorchProcessGroupAdapter(
+            device_group=node_device_group,
+            command_group=node_command_group,
+            ranks=node_ranks,
+            node_meta=node_meta,
+        )
+
+    return global_group_adapter, dp_group_adapter, node_group_adapter
 
 
 class PPLXDispatch(torch.autograd.Function):

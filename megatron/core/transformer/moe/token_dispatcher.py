@@ -1398,21 +1398,28 @@ class _PplxGardenManager(_DispatchManager):
 
     def __init__(
         self,
-        group: torch.distributed.ProcessGroup,
+        global_group: torch.distributed.ProcessGroup,
+        dp_group: torch.distributed.ProcessGroup,
         num_local_experts: int,
         router_topk: int,
         num_experts: int,
         config: TransformerConfig,
     ):
-        self.group = group
+        self.global_group = global_group
+        self.dp_group = dp_group
         self.num_local_experts = num_local_experts
         self.router_topk = router_topk
         self.num_experts = num_experts
         self.config = config
-        self.rank = torch.distributed.get_rank(group)
+        self.rank = torch.distributed.get_group_rank(
+            global_group, torch.distributed.get_rank()
+        )
+        self.dp_size = utils.get_pg_size(dp_group)
+        self.num_dp_groups = utils.get_pg_size(global_group) // self.dp_size
         self.router_dtype = config.moe_router_dtype
 
         self._global_group_adapter = None
+        self._dp_group_adapter = None
         self._node_group_adapter = None
         self._hidden_kernel = None
         self._routing_kernel = None
@@ -1427,7 +1434,10 @@ class _PplxGardenManager(_DispatchManager):
         self.token_indices: Optional[torch.Tensor] = None
         self.dispatched_probs: Optional[torch.Tensor] = None
 
-        assert self.num_experts == self.group.size() * self.num_local_experts, (
+        assert (
+            self.num_experts
+            == utils.get_pg_size(self.global_group) * self.num_local_experts
+        ), (
             "pplx_garden backend expects num_experts to match TPxEP group size times "
             "num_local_experts"
         )
@@ -1466,10 +1476,15 @@ class _PplxGardenManager(_DispatchManager):
 
         self._destroy_kernels()
         self._kernel_config = kernel_config
-        self._max_recv_tokens = num_tokens * self.router_topk * self.group.size()
-        if self._global_group_adapter is None or self._node_group_adapter is None:
-            self._global_group_adapter, self._node_group_adapter = (
-                make_pplx_process_group_adapters(self.group)
+        self._max_recv_tokens = num_tokens * self.num_local_experts * self.num_dp_groups
+        if self._global_group_adapter is None or self._dp_group_adapter is None:
+            (
+                self._global_group_adapter,
+                self._dp_group_adapter,
+                self._node_group_adapter,
+            ) = make_pplx_process_group_adapters(
+                self.global_group,
+                self.dp_group,
             )
 
         kernel_kwargs = dict(
@@ -1482,7 +1497,7 @@ class _PplxGardenManager(_DispatchManager):
             nets_per_gpu=self.config.moe_pplx_garden_nets_per_gpu,
             max_private_tokens=None,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-            dp_group=None,
+            dp_group=self._dp_group_adapter,
             node_group=self._node_group_adapter,
             global_group=self._global_group_adapter,
         )
@@ -1684,7 +1699,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             ]
         elif self.config.moe_flex_dispatcher_backend == "pplx_garden":
             self._comm_manager = _PplxGardenManager(
-                group=self.tp_ep_group,
+                global_group=self.tp_ep_group,
+                dp_group=self.tp_group,
                 num_local_experts=self.num_local_experts,
                 router_topk=self.tp_size * self.config.moe_router_topk,
                 num_experts=self.tp_size * self.config.num_moe_experts,
