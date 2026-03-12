@@ -9,7 +9,9 @@ import torch.distributed
 
 from megatron.core import config
 from megatron.core.utils import is_te_min_version
-from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
+from tests.test_utils.python_scripts.download_unit_tests_dataset import (
+    download_and_extract_asset,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -21,8 +23,8 @@ def pytest_addoption(parser):
         --experimental: Enable the Mcore experimental flag (DEFAULT: False)
     """
     parser.addoption(
-        '--experimental',
-        action='store_true',
+        "--experimental",
+        action="store_true",
         help="pass that argument to enable experimental flag during testing (DEFAULT: False)",
     )
 
@@ -49,8 +51,8 @@ def cleanup():
 @pytest.fixture(scope="function", autouse=True)
 def set_env():
     if is_te_min_version("1.3"):
-        os.environ['NVTE_FLASH_ATTN'] = '0'
-        os.environ['NVTE_FUSED_ATTN'] = '0'
+        os.environ["NVTE_FLASH_ATTN"] = "0"
+        os.environ["NVTE_FUSED_ATTN"] = "0"
 
 
 @pytest.fixture(scope="session")
@@ -60,8 +62,8 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
     Can't use pytest `tmp_path_factory` directly because directory must be shared between processes.
     """
 
-    tmp_dir = tmp_path_factory.mktemp('ignored', numbered=False)
-    tmp_dir = tmp_dir.parent.parent / 'tmp_dist_ckpt'
+    tmp_dir = tmp_path_factory.mktemp("ignored", numbered=False)
+    tmp_dir = tmp_dir.parent.parent / "tmp_dist_ckpt"
 
     if Utils.rank == 0:
         with TempNamedDir(tmp_dir, sync=False):
@@ -82,7 +84,7 @@ def ensure_test_data():
 
         try:
             # Download assets to /opt/data
-            download_and_extract_asset(assets_dir=str(data_path))
+            download_and_extract_asset(assets_dir=data_path)
 
             print("Test data downloaded successfully.")
 

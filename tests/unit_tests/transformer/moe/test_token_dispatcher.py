@@ -17,6 +17,16 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
+def get_runtime_world_size():
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+PPLX_SINGLE_NODE_FWD_BWD_CASES = [(1, 4), (2, 2)]
+PPLX_MULTI_NODE_FWD_BWD_CASES = [(1, 8), (4, 2)]
+PPLX_SINGLE_NODE_INFERENCE_CASES = [(1, 4)]
+PPLX_MULTI_NODE_INFERENCE_CASES = [(1, 8)]
+
+
 def token_permutation(token_dispatcher, hidden_states, probs, indices):
     hidden_states, probs = token_dispatcher.dispatch_preprocess(
         hidden_states, indices, probs
@@ -115,8 +125,13 @@ class MoEModelTestContainer:
         return moe_layer
 
     def __del__(self):
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
+        try:
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
@@ -618,8 +633,10 @@ class TestPplxGardenFlexDispatcher:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
-    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (4, 2)])
-    def test_forward_backward(self, tp_size, ep_size):
+    @pytest.mark.parametrize("tp_size,ep_size", PPLX_SINGLE_NODE_FWD_BWD_CASES)
+    def test_single_node_forward_backward(self, tp_size, ep_size):
+        if get_runtime_world_size() != 4:
+            pytest.skip("single-node pplx test requires WORLD_SIZE=4")
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -637,12 +654,67 @@ class TestPplxGardenFlexDispatcher:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
-    def test_inference_no_grad(self):
+    @pytest.mark.parametrize("tp_size,ep_size", PPLX_SINGLE_NODE_INFERENCE_CASES)
+    def test_single_node_inference_no_grad(self, tp_size, ep_size):
+        if get_runtime_world_size() != 4:
+            pytest.skip("single-node pplx test requires WORLD_SIZE=4")
         container = MoEModelTestContainer(
-            tp_size=1,
-            ep_size=8,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=ep_size,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="pplx_garden",
+            moe_permute_fusion=False,
+            test_dtype=torch.bfloat16,
+        )
+
+        moe_layer = container.moe_layer
+        hidden_states = torch.randn(
+            (16, 4, moe_layer.config.hidden_size), dtype=container.test_dtype
+        )
+        hidden_states = hidden_states.cuda()
+
+        with torch.no_grad():
+            output, _ = moe_layer(hidden_states)
+
+        assert output.shape == hidden_states.shape
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", PPLX_MULTI_NODE_FWD_BWD_CASES)
+    def test_multi_node_forward_backward(self, tp_size, ep_size):
+        if get_runtime_world_size() != 8:
+            pytest.skip("multi-node pplx test requires WORLD_SIZE=8")
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
             pp_size=1,
             num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="pplx_garden",
+            moe_permute_fusion=False,
+            test_dtype=torch.bfloat16,
+        )
+        container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", PPLX_MULTI_NODE_INFERENCE_CASES)
+    def test_multi_node_inference_no_grad(self, tp_size, ep_size):
+        if get_runtime_world_size() != 8:
+            pytest.skip("multi-node pplx test requires WORLD_SIZE=8")
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=ep_size,
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="flex",

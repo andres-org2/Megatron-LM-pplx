@@ -27,29 +27,30 @@ class TestModel(torch.nn.Module):
 
 
 class Utils:
-
-    world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    rank = int(os.environ.get('LOCAL_RANK', '0'))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     inited = False
     store = None
 
     @staticmethod
     def initialize_distributed():
 
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        os.environ.pop("NVTE_FLASH_ATTN", None)
+        os.environ.pop("NVTE_FUSED_ATTN", None)
+        os.environ.pop("NVTE_UNFUSED_ATTN", None)
 
         if not torch.distributed.is_initialized() and Utils.rank >= 0:
             print(
-                f'Initializing torch.distributed with rank: {Utils.rank}, '
-                f'world_size: {Utils.world_size}'
+                f"Initializing torch.distributed with rank: {Utils.rank}, "
+                f"local_rank: {Utils.local_rank}, "
+                f"world_size: {Utils.world_size}"
             )
-            torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
-            init_method = 'tcp://'
-            master_ip = os.getenv('MASTER_ADDR', 'localhost')
-            master_port = os.getenv('MASTER_PORT', '6000')
-            init_method += master_ip + ':' + master_port
+            torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
+            init_method = "tcp://"
+            master_ip = os.getenv("MASTER_ADDR", "localhost")
+            master_port = os.getenv("MASTER_PORT", "6000")
+            init_method += master_ip + ":" + master_port
             rendezvous_iterator = rendezvous(
                 init_method, Utils.rank, Utils.world_size, timeout=timedelta(minutes=1)
             )
@@ -62,7 +63,10 @@ class Utils:
             Utils.store = store
 
             torch.distributed.init_process_group(
-                backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
+                backend="nccl",
+                world_size=Utils.world_size,
+                rank=Utils.rank,
+                store=store,
             )
 
             torch.distributed.barrier()
@@ -70,7 +74,10 @@ class Utils:
 
     @staticmethod
     def set_world_size(world_size=None, rank=None):
-        Utils.world_size = torch.cuda.device_count() if world_size is None else world_size
+        Utils.world_size = (
+            torch.cuda.device_count() if world_size is None else world_size
+        )
+        Utils.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         if (
             torch.distributed.is_initialized()
             and Utils.world_size != torch.distributed.get_world_size()
@@ -78,7 +85,7 @@ class Utils:
             torch.distributed.destroy_process_group()
 
         if rank is None:
-            Utils.rank = int(os.environ['LOCAL_RANK'])
+            Utils.rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
             if Utils.rank >= Utils.world_size:
                 Utils.rank = -1
         else:
@@ -86,12 +93,13 @@ class Utils:
 
     @staticmethod
     def destroy_model_parallel():
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        os.environ.pop("NVTE_FLASH_ATTN", None)
+        os.environ.pop("NVTE_FUSED_ATTN", None)
+        os.environ.pop("NVTE_UNFUSED_ATTN", None)
         if not Utils.inited:
             return
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         ps.destroy_model_parallel()
         Utils.inited = False
 
@@ -104,9 +112,9 @@ class Utils:
     ):
         # Need to unset these variables to make sure previous
         # tests setting them doesn't interfere current test.
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        os.environ.pop("NVTE_FLASH_ATTN", None)
+        os.environ.pop("NVTE_FUSED_ATTN", None)
+        os.environ.pop("NVTE_UNFUSED_ATTN", None)
 
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
@@ -132,7 +140,9 @@ class Utils:
         ps.set_expert_model_parallel_world_size(expert_model_parallel_size)
         ps.set_expert_model_parallel_rank(0)
         if virtual_pipeline_model_parallel_size is not None:
-            ps.set_virtual_pipeline_model_parallel_world_size(virtual_pipeline_model_parallel_size)
+            ps.set_virtual_pipeline_model_parallel_world_size(
+                virtual_pipeline_model_parallel_size
+            )
         ps.set_virtual_pipeline_model_parallel_rank(0)
 
         ps.set_pipeline_model_parallel_world_size(pipeline_model_parallel_size)
