@@ -1439,12 +1439,15 @@ class _PplxGardenManager(_DispatchManager):
         self._max_recv_tokens = None
         self._num_local_tokens = None
         self._dispatch_weights = None
-        self._permuted_prob_columns = None
+        self._local_expert_columns = None
 
         self.tokens_per_expert: Optional[torch.Tensor] = None
         self.token_probs: Optional[torch.Tensor] = None
         self.token_indices: Optional[torch.Tensor] = None
         self.dispatched_probs: Optional[torch.Tensor] = None
+        self.dispatched_routing_map: Optional[torch.Tensor] = None
+        self.hidden_shape_before_permute: Optional[torch.Size] = None
+        self.reversed_mapping_for_combine: Optional[torch.Tensor] = None
 
         assert (
             self.num_experts
@@ -1599,36 +1602,16 @@ class _PplxGardenManager(_DispatchManager):
         )
 
         local_expert_start = self.rank * self.num_local_experts
-        self._permuted_prob_columns = [
+        self._local_expert_columns = [
             local_expert_start + local_expert_idx
             for local_expert_idx in range(self.num_local_experts)
         ]
 
-    def _extract_permuted_probs(
-        self, dispatched_prob_matrix: torch.Tensor
+    def _get_dispatched_local_tensor(
+        self, dispatched_tensor: torch.Tensor
     ) -> torch.Tensor:
-        assert self.tokens_per_expert is not None
-        assert self._permuted_prob_columns is not None
-
-        permuted_probs = []
-        offset = 0
-        for expert_idx, num_tokens in enumerate(self.tokens_per_expert.tolist()):
-            next_offset = offset + num_tokens
-            if num_tokens > 0:
-                permuted_probs.append(
-                    dispatched_prob_matrix[
-                        offset:next_offset, self._permuted_prob_columns[expert_idx]
-                    ]
-                )
-            offset = next_offset
-
-        if not permuted_probs:
-            return torch.empty(
-                (0,),
-                dtype=dispatched_prob_matrix.dtype,
-                device=dispatched_prob_matrix.device,
-            )
-        return torch.cat(permuted_probs, dim=0)
+        assert self._local_expert_columns is not None
+        return dispatched_tensor[:, self._local_expert_columns]
 
     def dispatch(
         self,
@@ -1667,6 +1650,25 @@ class _PplxGardenManager(_DispatchManager):
             f"tokens_per_expert={tokens_per_expert.tolist()}"
         )
         _pplx_debug_log(
+            "dispatch routing start "
+            f"routing_map_shape={tuple(self.token_probs.shape)} "
+            f"token_indices_shape={tuple(self.token_indices.shape)}"
+        )
+        dispatched_routing_matrix, _ = pplx_dispatch(
+            self.token_probs.new_zeros(self.token_probs.shape).scatter_(
+                1, self.token_indices.long(), 1.0
+            ),
+            self.token_indices,
+            self._dispatch_weights,
+            self._routing_kernel,
+            self.num_local_experts,
+            self._max_recv_tokens,
+        )
+        _pplx_debug_log(
+            "dispatch routing end "
+            f"dispatched_routing_matrix_shape={tuple(dispatched_routing_matrix.shape)}"
+        )
+        _pplx_debug_log(
             "dispatch probs start "
             f"token_probs_shape={tuple(self.token_probs.shape)} "
             f"token_probs_dtype={self.token_probs.dtype}"
@@ -1685,7 +1687,22 @@ class _PplxGardenManager(_DispatchManager):
         )
 
         self.tokens_per_expert = tokens_per_expert.to(torch.long)
-        self.dispatched_probs = self._extract_permuted_probs(dispatched_prob_matrix)
+        self.dispatched_routing_map = self._get_dispatched_local_tensor(
+            dispatched_routing_matrix
+        ).bool()
+        dispatched_local_probs = self._get_dispatched_local_tensor(
+            dispatched_prob_matrix
+        )
+        self.hidden_shape_before_permute = dispatched_hidden.shape
+        dispatched_hidden, self.dispatched_probs, self.reversed_mapping_for_combine = (
+            permute(
+                dispatched_hidden,
+                self.dispatched_routing_map,
+                probs=dispatched_local_probs,
+                num_out_tokens=self.tokens_per_expert.sum().item(),
+                fused=self.config.moe_permute_fusion,
+            )
+        )
         _pplx_debug_log(
             "dispatch probs extracted "
             f"dispatched_probs_shape={tuple(self.dispatched_probs.shape)} "
@@ -1709,7 +1726,16 @@ class _PplxGardenManager(_DispatchManager):
     def get_restored_hidden_states_by_experts(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        return hidden_states
+        assert self.reversed_mapping_for_combine is not None
+        assert self.hidden_shape_before_permute is not None
+        assert self.dispatched_routing_map is not None
+        return unpermute(
+            hidden_states,
+            self.reversed_mapping_for_combine,
+            restore_shape=self.hidden_shape_before_permute,
+            routing_map=self.dispatched_routing_map,
+            fused=self.config.moe_permute_fusion,
+        )
 
     def combine(
         self,
