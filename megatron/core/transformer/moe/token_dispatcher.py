@@ -1439,6 +1439,7 @@ class _PplxGardenManager(_DispatchManager):
         self._max_recv_tokens = None
         self._num_local_tokens = None
         self._dispatch_weights = None
+        self._combine_weights = None
         self._permuted_prob_columns = None
 
         self.tokens_per_expert: Optional[torch.Tensor] = None
@@ -1580,7 +1581,8 @@ class _PplxGardenManager(_DispatchManager):
             probs,
             dim=-1,
             index=self.token_indices.to(torch.int64),
-        )
+        ).to(torch.float32)
+        self._combine_weights = selected_probs
         _pplx_debug_log(
             "setup metadata "
             f"routing_map_shape={tuple(routing_map.shape)} probs_shape={tuple(probs.shape)} "
@@ -1645,6 +1647,7 @@ class _PplxGardenManager(_DispatchManager):
         assert self.token_indices is not None
         assert self.token_probs is not None
         assert self._dispatch_weights is not None
+        assert self._combine_weights is not None
 
         self._ensure_kernels(
             hidden_states.shape[0], hidden_states.shape[1], hidden_states.dtype
@@ -1718,7 +1721,7 @@ class _PplxGardenManager(_DispatchManager):
             )
 
         assert self.token_indices is not None
-        assert self._dispatch_weights is not None
+        assert self._combine_weights is not None
         assert self._hidden_kernel is not None
         assert self._num_local_tokens is not None
 
@@ -1730,7 +1733,7 @@ class _PplxGardenManager(_DispatchManager):
         restored_hidden = pplx_combine(
             hidden_states,
             self.token_indices,
-            self._dispatch_weights,
+            self._combine_weights,
             self._hidden_kernel,
             self._num_local_tokens,
             self.num_local_experts,
