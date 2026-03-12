@@ -1434,7 +1434,8 @@ class _PplxGardenManager(_DispatchManager):
         self._dp_group_adapter = None
         self._node_group_adapter = None
         self._hidden_kernel = None
-        self._routing_kernel = None
+        self._routing_map_kernel = None
+        self._prob_kernel = None
         self._kernel_config = None
         self._max_recv_tokens = None
         self._num_local_tokens = None
@@ -1467,9 +1468,12 @@ class _PplxGardenManager(_DispatchManager):
         if self._hidden_kernel is not None:
             self._hidden_kernel.destroy()
             self._hidden_kernel = None
-        if self._routing_kernel is not None:
-            self._routing_kernel.destroy()
-            self._routing_kernel = None
+        if self._routing_map_kernel is not None:
+            self._routing_map_kernel.destroy()
+            self._routing_map_kernel = None
+        if self._prob_kernel is not None:
+            self._prob_kernel.destroy()
+            self._prob_kernel = None
         self._kernel_config = None
         self._max_recv_tokens = None
 
@@ -1535,7 +1539,13 @@ class _PplxGardenManager(_DispatchManager):
             out_dtype=hidden_dtype,
             **kernel_kwargs,
         )
-        self._routing_kernel = P2PAllToAll(
+        self._routing_map_kernel = P2PAllToAll(
+            hidden_dim=self.num_experts,
+            in_dtype=torch.float32,
+            out_dtype=torch.float32,
+            **kernel_kwargs,
+        )
+        self._prob_kernel = P2PAllToAll(
             hidden_dim=self.num_experts,
             in_dtype=torch.float32,
             out_dtype=torch.float32,
@@ -1543,7 +1553,9 @@ class _PplxGardenManager(_DispatchManager):
         )
         _pplx_debug_log(
             "ensure kernels end "
-            f"max_recv_tokens={self._max_recv_tokens} routing_hidden_dim={self.num_experts}"
+            f"max_recv_tokens={self._max_recv_tokens} routing_hidden_dim={self.num_experts} "
+            f"routing_map_kernel_id={id(self._routing_map_kernel)} "
+            f"prob_kernel_id={id(self._prob_kernel)}"
         )
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
@@ -1660,7 +1672,7 @@ class _PplxGardenManager(_DispatchManager):
             ),
             self.token_indices,
             self._dispatch_weights,
-            self._routing_kernel,
+            self._routing_map_kernel,
             self.num_local_experts,
             self._max_recv_tokens,
         )
@@ -1677,7 +1689,7 @@ class _PplxGardenManager(_DispatchManager):
             self.token_probs.float(),
             self.token_indices,
             self._dispatch_weights,
-            self._routing_kernel,
+            self._prob_kernel,
             self.num_local_experts,
             self._max_recv_tokens,
         )
