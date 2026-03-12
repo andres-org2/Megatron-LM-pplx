@@ -3,6 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import logging
 import os
 import socket
 
@@ -28,6 +29,18 @@ import torch
 
 _buffer = None
 _process_group_cache = {}
+_logger = logging.getLogger(__name__)
+
+
+def _pplx_debug_enabled() -> bool:
+    return os.environ.get("MEGATRON_PPLX_DEBUG", "0") == "1"
+
+
+def _pplx_debug_log(message: str) -> None:
+    if _pplx_debug_enabled():
+        _logger.warning(
+            "[pplx-debug][rank=%s] %s", torch.distributed.get_rank(), message
+        )
 
 
 def _get_or_create_process_group(ranks, backend):
@@ -230,6 +243,13 @@ class PPLXDispatch(torch.autograd.Function):
         num_local_experts,
         max_recv_tokens,
     ):
+        _pplx_debug_log(
+            "dispatch forward start "
+            f"x_shape={tuple(x.shape)} x_dtype={x.dtype} x_stride={tuple(x.stride())} "
+            f"indices_shape={tuple(token_indices.shape)} indices_dtype={token_indices.dtype} "
+            f"weights_shape={tuple(dispatch_weights.shape)} weights_dtype={dispatch_weights.dtype} "
+            f"max_recv_tokens={max_recv_tokens} num_local_experts={num_local_experts}"
+        )
         out_num_tokens = torch.empty(
             (num_local_experts,), dtype=torch.int32, device=x.device
         )
@@ -246,6 +266,10 @@ class PPLXDispatch(torch.autograd.Function):
             weights=dispatch_weights.contiguous(),
         )
         num_recv_tokens = int(out_num_tokens.sum().item())
+        _pplx_debug_log(
+            "dispatch forward end "
+            f"num_recv_tokens={num_recv_tokens} tokens_per_expert={out_num_tokens.tolist()}"
+        )
         ctx.kernel = kernel
         ctx.num_input_tokens = x.shape[0]
         ctx.num_local_experts = num_local_experts
@@ -256,6 +280,10 @@ class PPLXDispatch(torch.autograd.Function):
     def backward(ctx, grad_output, grad_num_tokens):
         del grad_num_tokens
         token_indices, dispatch_weights = ctx.saved_tensors
+        _pplx_debug_log(
+            "dispatch backward start "
+            f"grad_output_shape={tuple(grad_output.shape)} grad_output_dtype={grad_output.dtype}"
+        )
         grad_x = torch.empty(
             (ctx.num_input_tokens, grad_output.shape[1]),
             dtype=grad_output.dtype,
@@ -267,6 +295,7 @@ class PPLXDispatch(torch.autograd.Function):
             weights=dispatch_weights.contiguous(),
             expert_y=grad_output.contiguous(),
         )
+        _pplx_debug_log("dispatch backward end")
         return grad_x, None, None, None, None, None
 
 
@@ -277,6 +306,13 @@ class PPLXCombine(torch.autograd.Function):
     def forward(
         ctx, x, token_indices, combine_weights, kernel, num_tokens, num_local_experts
     ):
+        _pplx_debug_log(
+            "combine forward start "
+            f"x_shape={tuple(x.shape)} x_dtype={x.dtype} x_stride={tuple(x.stride())} "
+            f"indices_shape={tuple(token_indices.shape)} indices_dtype={token_indices.dtype} "
+            f"weights_shape={tuple(combine_weights.shape)} weights_dtype={combine_weights.dtype} "
+            f"num_tokens={num_tokens} num_local_experts={num_local_experts}"
+        )
         out_tokens = torch.empty(
             (num_tokens, x.shape[1]), dtype=x.dtype, device=x.device
         )
@@ -286,6 +322,7 @@ class PPLXCombine(torch.autograd.Function):
             weights=combine_weights.contiguous(),
             expert_y=x.contiguous(),
         )
+        _pplx_debug_log("combine forward end")
         ctx.kernel = kernel
         ctx.num_local_experts = num_local_experts
         ctx.num_expert_tokens = x.shape[0]
@@ -295,6 +332,10 @@ class PPLXCombine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         token_indices, combine_weights = ctx.saved_tensors
+        _pplx_debug_log(
+            "combine backward start "
+            f"grad_output_shape={tuple(grad_output.shape)} grad_output_dtype={grad_output.dtype}"
+        )
         out_num_tokens = torch.empty(
             (ctx.num_local_experts,), dtype=torch.int32, device=grad_output.device
         )
@@ -313,6 +354,10 @@ class PPLXCombine(torch.autograd.Function):
             weights=combine_weights.contiguous(),
         )
         num_recv_tokens = int(out_num_tokens.sum().item())
+        _pplx_debug_log(
+            "combine backward end "
+            f"num_recv_tokens={num_recv_tokens} tokens_per_expert={out_num_tokens.tolist()}"
+        )
         return out_x[:num_recv_tokens], None, None, None, None, None
 
 

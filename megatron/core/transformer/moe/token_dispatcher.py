@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -52,6 +53,17 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 """
 
 logger = logging.getLogger(__name__)
+
+
+def _pplx_debug_enabled() -> bool:
+    return os.environ.get("MEGATRON_PPLX_DEBUG", "0") == "1"
+
+
+def _pplx_debug_log(message: str) -> None:
+    if _pplx_debug_enabled():
+        logger.warning(
+            "[pplx-debug][rank=%s] %s", torch.distributed.get_rank(), message
+        )
 
 
 class MoETokenDispatcher:
@@ -1474,6 +1486,12 @@ class _PplxGardenManager(_DispatchManager):
         if self._kernel_config == kernel_config:
             return
 
+        _pplx_debug_log(
+            "ensure kernels start "
+            f"num_tokens={num_tokens} hidden_dim={hidden_dim} hidden_dtype={hidden_dtype} "
+            f"tp_ep_size={utils.get_pg_size(self.global_group)} tp_size={self.dp_size} "
+            f"num_dp_groups={self.num_dp_groups} num_local_experts={self.num_local_experts}"
+        )
         self._destroy_kernels()
         self._kernel_config = kernel_config
         self._max_recv_tokens = num_tokens * self.num_local_experts * self.num_dp_groups
@@ -1485,6 +1503,13 @@ class _PplxGardenManager(_DispatchManager):
             ) = make_pplx_process_group_adapters(
                 self.global_group,
                 self.dp_group,
+            )
+            _pplx_debug_log(
+                "group adapters ready "
+                f"global_size={self._global_group_adapter.size} "
+                f"dp_size={self._dp_group_adapter.size} "
+                "node_size="
+                f"{None if self._node_group_adapter is None else self._node_group_adapter.size}"
             )
 
         kernel_kwargs = dict(
@@ -1513,6 +1538,10 @@ class _PplxGardenManager(_DispatchManager):
             out_dtype=torch.float32,
             **kernel_kwargs,
         )
+        _pplx_debug_log(
+            "ensure kernels end "
+            f"max_recv_tokens={self._max_recv_tokens} routing_hidden_dim={self.num_experts}"
+        )
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
@@ -1527,6 +1556,14 @@ class _PplxGardenManager(_DispatchManager):
         )
         self.token_indices = torch.topk(probs, self.router_topk, dim=-1).indices.to(
             torch.uint32
+        )
+        _pplx_debug_log(
+            "setup metadata "
+            f"routing_map_shape={tuple(routing_map.shape)} probs_shape={tuple(probs.shape)} "
+            f"token_indices_shape={tuple(self.token_indices.shape)} router_topk={self.router_topk} "
+            f"num_experts={self.num_experts} "
+            f"token_indices_min={int(self.token_indices.min().item())} "
+            f"token_indices_max={int(self.token_indices.max().item())}"
         )
 
         local_expert_start = self.rank * self.num_local_experts
@@ -1580,6 +1617,10 @@ class _PplxGardenManager(_DispatchManager):
         self._ensure_kernels(
             hidden_states.shape[0], hidden_states.shape[1], hidden_states.dtype
         )
+        _pplx_debug_log(
+            "dispatch hidden start "
+            f"hidden_shape={tuple(hidden_states.shape)} hidden_dtype={hidden_states.dtype}"
+        )
         dispatched_hidden, tokens_per_expert = pplx_dispatch(
             hidden_states,
             self.token_indices,
@@ -1588,6 +1629,16 @@ class _PplxGardenManager(_DispatchManager):
             self.num_local_experts,
             self._max_recv_tokens,
         )
+        _pplx_debug_log(
+            "dispatch hidden end "
+            f"dispatched_hidden_shape={tuple(dispatched_hidden.shape)} "
+            f"tokens_per_expert={tokens_per_expert.tolist()}"
+        )
+        _pplx_debug_log(
+            "dispatch probs start "
+            f"token_probs_shape={tuple(self.token_probs.shape)} "
+            f"token_probs_dtype={self.token_probs.dtype}"
+        )
         dispatched_prob_matrix, _ = pplx_dispatch(
             self.token_probs.float(),
             self.token_indices,
@@ -1595,6 +1646,10 @@ class _PplxGardenManager(_DispatchManager):
             self._routing_kernel,
             self.num_local_experts,
             self._max_recv_tokens,
+        )
+        _pplx_debug_log(
+            "dispatch probs end "
+            f"dispatched_prob_matrix_shape={tuple(dispatched_prob_matrix.shape)}"
         )
 
         self.tokens_per_expert = tokens_per_expert.to(torch.long)
@@ -1635,7 +1690,12 @@ class _PplxGardenManager(_DispatchManager):
         assert self._hidden_kernel is not None
         assert self._num_local_tokens is not None
 
-        return pplx_combine(
+        _pplx_debug_log(
+            "combine start "
+            f"hidden_shape={tuple(hidden_states.shape)} hidden_dtype={hidden_states.dtype} "
+            f"num_local_tokens={self._num_local_tokens}"
+        )
+        restored_hidden = pplx_combine(
             hidden_states,
             self.token_indices,
             self._dispatch_weights,
@@ -1643,6 +1703,12 @@ class _PplxGardenManager(_DispatchManager):
             self._num_local_tokens,
             self.num_local_experts,
         )
+        _pplx_debug_log(
+            "combine end "
+            f"restored_hidden_shape={tuple(restored_hidden.shape)} "
+            f"restored_hidden_dtype={restored_hidden.dtype}"
+        )
+        return restored_hidden
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
