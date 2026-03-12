@@ -1447,8 +1447,8 @@ class _PplxGardenManager(_DispatchManager):
         self.token_indices: Optional[torch.Tensor] = None
         self.dispatched_probs: Optional[torch.Tensor] = None
         self.dispatched_routing_map: Optional[torch.Tensor] = None
-        self.hidden_shape_before_permute: Optional[torch.Size] = None
-        self.reversed_mapping_for_combine: Optional[torch.Tensor] = None
+        self._local_sort_order: Optional[torch.Tensor] = None
+        self._local_unsort_order: Optional[torch.Tensor] = None
 
         assert (
             self.num_experts
@@ -1625,6 +1625,42 @@ class _PplxGardenManager(_DispatchManager):
         assert self._local_expert_columns is not None
         return dispatched_tensor[:, self._local_expert_columns]
 
+    def _sort_by_local_expert(
+        self,
+        hidden_states: torch.Tensor,
+        local_routing: torch.Tensor,
+        local_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        row_expert_counts = local_routing.sum(dim=-1)
+        if not torch.all(row_expert_counts == 1):
+            unique_counts = torch.unique(row_expert_counts).tolist()
+            raise ValueError(
+                "pplx_garden backend expects each dispatched row to map to exactly one local "
+                f"expert, but saw local counts {unique_counts}"
+            )
+
+        local_expert_index = local_routing.argmax(dim=-1)
+        row_indices = torch.arange(local_routing.shape[0], device=local_routing.device)
+        local_prob_per_row = local_probs[row_indices, local_expert_index]
+        self.tokens_per_expert = torch.bincount(
+            local_expert_index, minlength=self.num_local_experts
+        ).to(torch.long)
+        self._local_sort_order = torch.argsort(local_expert_index, stable=True)
+        self._local_unsort_order = torch.empty_like(self._local_sort_order)
+        self._local_unsort_order[self._local_sort_order] = torch.arange(
+            self._local_sort_order.numel(), device=self._local_sort_order.device
+        )
+
+        _pplx_debug_log(
+            "local expert sort "
+            f"row_expert_counts_unique={torch.unique(row_expert_counts).tolist()} "
+            f"tokens_per_expert={self.tokens_per_expert.tolist()}"
+        )
+
+        return hidden_states[self._local_sort_order], local_prob_per_row[
+            self._local_sort_order
+        ]
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -1698,22 +1734,17 @@ class _PplxGardenManager(_DispatchManager):
             f"dispatched_prob_matrix_shape={tuple(dispatched_prob_matrix.shape)}"
         )
 
-        self.tokens_per_expert = tokens_per_expert.to(torch.long)
+        del tokens_per_expert
         self.dispatched_routing_map = self._get_dispatched_local_tensor(
             dispatched_routing_matrix
         ).bool()
         dispatched_local_probs = self._get_dispatched_local_tensor(
             dispatched_prob_matrix
         )
-        self.hidden_shape_before_permute = dispatched_hidden.shape
-        dispatched_hidden, self.dispatched_probs, self.reversed_mapping_for_combine = (
-            permute(
-                dispatched_hidden,
-                self.dispatched_routing_map,
-                probs=dispatched_local_probs,
-                num_out_tokens=self.tokens_per_expert.sum().item(),
-                fused=self.config.moe_permute_fusion,
-            )
+        dispatched_hidden, self.dispatched_probs = self._sort_by_local_expert(
+            dispatched_hidden,
+            self.dispatched_routing_map,
+            dispatched_local_probs,
         )
         _pplx_debug_log(
             "dispatch probs extracted "
@@ -1738,16 +1769,8 @@ class _PplxGardenManager(_DispatchManager):
     def get_restored_hidden_states_by_experts(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        assert self.reversed_mapping_for_combine is not None
-        assert self.hidden_shape_before_permute is not None
-        assert self.dispatched_routing_map is not None
-        return unpermute(
-            hidden_states,
-            self.reversed_mapping_for_combine,
-            restore_shape=self.hidden_shape_before_permute,
-            routing_map=self.dispatched_routing_map,
-            fused=self.config.moe_permute_fusion,
-        )
+        assert self._local_unsort_order is not None
+        return hidden_states[self._local_unsort_order]
 
     def combine(
         self,
