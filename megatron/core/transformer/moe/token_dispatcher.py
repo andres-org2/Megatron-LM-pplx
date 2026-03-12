@@ -1447,8 +1447,10 @@ class _PplxGardenManager(_DispatchManager):
         self.token_indices: Optional[torch.Tensor] = None
         self.dispatched_probs: Optional[torch.Tensor] = None
         self.dispatched_routing_map: Optional[torch.Tensor] = None
-        self._local_sort_order: Optional[torch.Tensor] = None
-        self._local_unsort_order: Optional[torch.Tensor] = None
+        self._expanded_sort_order: Optional[torch.Tensor] = None
+        self._expanded_unsort_order: Optional[torch.Tensor] = None
+        self._expanded_row_indices: Optional[torch.Tensor] = None
+        self._num_dispatched_rows: Optional[int] = None
 
         assert (
             self.num_experts
@@ -1625,40 +1627,44 @@ class _PplxGardenManager(_DispatchManager):
         assert self._local_expert_columns is not None
         return dispatched_tensor[:, self._local_expert_columns]
 
-    def _sort_by_local_expert(
+    def _expand_and_sort_by_local_expert(
         self,
         hidden_states: torch.Tensor,
         local_routing: torch.Tensor,
         local_probs: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         row_expert_counts = local_routing.sum(dim=-1)
-        if not torch.all(row_expert_counts == 1):
+        if not torch.all(
+            (row_expert_counts >= 1) & (row_expert_counts <= self.router_topk)
+        ):
             unique_counts = torch.unique(row_expert_counts).tolist()
             raise ValueError(
-                "pplx_garden backend expects each dispatched row to map to exactly one local "
-                f"expert, but saw local counts {unique_counts}"
+                "pplx_garden backend expects each dispatched row to map to between 1 and "
+                f"{self.router_topk} local experts, but saw local counts {unique_counts}"
             )
 
-        local_expert_index = local_routing.argmax(dim=-1)
-        row_indices = torch.arange(local_routing.shape[0], device=local_routing.device)
-        local_prob_per_row = local_probs[row_indices, local_expert_index]
+        expanded_row_indices, local_expert_index = local_routing.nonzero(as_tuple=True)
+        expanded_hidden = hidden_states[expanded_row_indices]
+        expanded_probs = local_probs[expanded_row_indices, local_expert_index]
+        self._num_dispatched_rows = hidden_states.shape[0]
+        self._expanded_row_indices = expanded_row_indices
         self.tokens_per_expert = torch.bincount(
             local_expert_index, minlength=self.num_local_experts
         ).to(torch.long)
-        self._local_sort_order = torch.argsort(local_expert_index, stable=True)
-        self._local_unsort_order = torch.empty_like(self._local_sort_order)
-        self._local_unsort_order[self._local_sort_order] = torch.arange(
-            self._local_sort_order.numel(), device=self._local_sort_order.device
+        self._expanded_sort_order = torch.argsort(local_expert_index, stable=True)
+        self._expanded_unsort_order = torch.empty_like(self._expanded_sort_order)
+        self._expanded_unsort_order[self._expanded_sort_order] = torch.arange(
+            self._expanded_sort_order.numel(), device=self._expanded_sort_order.device
         )
 
         _pplx_debug_log(
-            "local expert sort "
+            "local expert expand/sort "
             f"row_expert_counts_unique={torch.unique(row_expert_counts).tolist()} "
             f"tokens_per_expert={self.tokens_per_expert.tolist()}"
         )
 
-        return hidden_states[self._local_sort_order], local_prob_per_row[
-            self._local_sort_order
+        return expanded_hidden[self._expanded_sort_order], expanded_probs[
+            self._expanded_sort_order
         ]
 
     def dispatch(
@@ -1741,10 +1747,12 @@ class _PplxGardenManager(_DispatchManager):
         dispatched_local_probs = self._get_dispatched_local_tensor(
             dispatched_prob_matrix
         )
-        dispatched_hidden, self.dispatched_probs = self._sort_by_local_expert(
-            dispatched_hidden,
-            self.dispatched_routing_map,
-            dispatched_local_probs,
+        dispatched_hidden, self.dispatched_probs = (
+            self._expand_and_sort_by_local_expert(
+                dispatched_hidden,
+                self.dispatched_routing_map,
+                dispatched_local_probs,
+            )
         )
         _pplx_debug_log(
             "dispatch probs extracted "
@@ -1769,8 +1777,18 @@ class _PplxGardenManager(_DispatchManager):
     def get_restored_hidden_states_by_experts(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        assert self._local_unsort_order is not None
-        return hidden_states[self._local_unsort_order]
+        assert self._expanded_unsort_order is not None
+        assert self._expanded_row_indices is not None
+        assert self._num_dispatched_rows is not None
+
+        hidden_states = hidden_states[self._expanded_unsort_order]
+        restored_hidden = torch.zeros(
+            (self._num_dispatched_rows, hidden_states.shape[-1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        restored_hidden.index_add_(0, self._expanded_row_indices, hidden_states)
+        return restored_hidden
 
     def combine(
         self,
