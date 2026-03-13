@@ -242,6 +242,7 @@ class PPLXDispatch(torch.autograd.Function):
         kernel,
         num_local_experts,
         max_recv_tokens,
+        return_prob,
     ):
         _pplx_debug_log(
             "dispatch forward start "
@@ -256,6 +257,11 @@ class PPLXDispatch(torch.autograd.Function):
         out_x = torch.empty(
             (max_recv_tokens, x.shape[1]), dtype=x.dtype, device=x.device
         )
+        out_prob = None
+        if return_prob:
+            out_prob = torch.empty(
+                (max_recv_tokens,), dtype=torch.float32, device=x.device
+            )
         kernel.dispatch(
             out_expert_num_tokens=out_num_tokens,
             out_expert_x=out_x,
@@ -264,6 +270,7 @@ class PPLXDispatch(torch.autograd.Function):
             dp_x_scale=None,
             indices=token_indices.contiguous(),
             weights=dispatch_weights.contiguous(),
+            out_expert_prob=out_prob,
         )
         num_recv_tokens = int(out_num_tokens.sum().item())
         _pplx_debug_log(
@@ -273,12 +280,15 @@ class PPLXDispatch(torch.autograd.Function):
         ctx.kernel = kernel
         ctx.num_input_tokens = x.shape[0]
         ctx.num_local_experts = num_local_experts
-        ctx.save_for_backward(token_indices, dispatch_weights)
-        return out_x[:num_recv_tokens], out_num_tokens
+        ctx.save_for_backward(token_indices, torch.ones_like(dispatch_weights))
+        if out_prob is None:
+            return out_x[:num_recv_tokens], out_num_tokens, None
+        return out_x[:num_recv_tokens], out_num_tokens, out_prob[:num_recv_tokens]
 
     @staticmethod
-    def backward(ctx, grad_output, grad_num_tokens):
+    def backward(ctx, grad_output, grad_num_tokens, grad_prob):
         del grad_num_tokens
+        del grad_prob
         token_indices, dispatch_weights = ctx.saved_tensors
         _pplx_debug_log(
             "dispatch backward start "
@@ -296,7 +306,7 @@ class PPLXDispatch(torch.autograd.Function):
             expert_y=grad_output.contiguous(),
         )
         _pplx_debug_log("dispatch backward end")
-        return grad_x, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None
 
 
 class PPLXCombine(torch.autograd.Function):
@@ -365,7 +375,13 @@ if HAVE_PPLX_GARDEN:
 
     @internal_api
     def pplx_dispatch(
-        x, token_indices, dispatch_weights, kernel, num_local_experts, max_recv_tokens
+        x,
+        token_indices,
+        dispatch_weights,
+        kernel,
+        num_local_experts,
+        max_recv_tokens,
+        return_prob=False,
     ):
         return PPLXDispatch.apply(
             x,
@@ -374,6 +390,7 @@ if HAVE_PPLX_GARDEN:
             kernel,
             num_local_experts,
             max_recv_tokens,
+            return_prob,
         )
 
     @internal_api
