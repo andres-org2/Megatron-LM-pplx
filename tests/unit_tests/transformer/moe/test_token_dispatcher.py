@@ -634,6 +634,53 @@ class TestPplxGardenFlexDispatcher:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
+    def test_single_node_metadata_layout_tp1_ep4(self):
+        if get_runtime_world_size() != 4:
+            pytest.skip("single-node pplx test requires WORLD_SIZE=4")
+
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=4,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="pplx_garden",
+            moe_permute_fusion=False,
+            test_dtype=torch.bfloat16,
+        )
+        moe_layer = container.moe_layer
+        hidden_states = torch.randn(
+            (8, 4, moe_layer.config.hidden_size), dtype=container.test_dtype
+        )
+        hidden_states = hidden_states.cuda()
+
+        probs, indices = apply_module(moe_layer.router)(hidden_states)
+        probs = torch.ones_like(probs) / moe_layer.router.topk
+
+        token_dispatcher = moe_layer.token_dispatcher
+        token_dispatcher.dispatch_preprocess(hidden_states, indices, probs)
+        token_indices = token_dispatcher._comm_manager.token_indices
+
+        assert token_indices is not None
+        assert token_indices.shape[-1] == moe_layer.router.topk
+
+        routing_map = indices.reshape(-1, container.config.num_moe_experts)
+        flat_token_indices = torch.arange(
+            container.config.num_moe_experts,
+            device=routing_map.device,
+            dtype=torch.int64,
+        ).expand(routing_map.shape[0], -1)
+        expected_token_indices = flat_token_indices[routing_map].reshape(
+            routing_map.shape[0], moe_layer.router.topk
+        )
+
+        torch.testing.assert_close(token_indices.long(), expected_token_indices)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", PPLX_SINGLE_NODE_FWD_BWD_CASES)
     def test_single_node_forward_backward(self, tp_size, ep_size):
         if get_runtime_world_size() != 4:

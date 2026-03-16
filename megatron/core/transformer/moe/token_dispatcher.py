@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core import utils
+from megatron.core import parallel_state, utils
 from megatron.core.config import is_experimental_enabled
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
@@ -1797,6 +1797,119 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             "Shared expert overlap is not supported in Flex Token Dispatcher."
         )
 
+    def _get_process_group_ranks(
+        self, group: torch.distributed.ProcessGroup
+    ) -> Optional[List[int]]:
+        get_group_ranks = getattr(torch.distributed, "get_process_group_ranks", None)
+        if get_group_ranks is None:
+            return None
+        return list(get_group_ranks(group))
+
+    def _validate_pplx_metadata_layout(
+        self,
+        original_routing_map: torch.Tensor,
+        expanded_routing_map: torch.Tensor,
+        original_probs: torch.Tensor,
+        expanded_probs: torch.Tensor,
+    ) -> None:
+        num_local_tokens = original_routing_map.shape[0]
+        original_routing_map = original_routing_map.reshape(num_local_tokens, -1)
+        expanded_routing_map = expanded_routing_map.reshape(num_local_tokens, -1)
+        original_probs = original_probs.reshape(num_local_tokens, -1)
+        expanded_probs = expanded_probs.reshape(num_local_tokens, -1)
+
+        original_routes_per_token = original_routing_map.sum(dim=-1)
+        expanded_routes_per_token = expanded_routing_map.sum(dim=-1)
+        if not torch.all(original_routes_per_token == self.config.moe_router_topk):
+            raise ValueError(
+                "Unexpected original pplx routing metadata: each token should route to "
+                f"{self.config.moe_router_topk} experts, saw "
+                f"{torch.unique(original_routes_per_token).tolist()}"
+            )
+        expected_expanded_routes = self.tp_size * self.config.moe_router_topk
+        if not torch.all(expanded_routes_per_token == expected_expanded_routes):
+            raise ValueError(
+                "Unexpected expanded pplx routing metadata: each token should route to "
+                f"{expected_expanded_routes} TPxEP experts, saw "
+                f"{torch.unique(expanded_routes_per_token).tolist()}"
+            )
+
+        original_flat_ids = torch.arange(
+            original_routing_map.shape[-1],
+            device=original_routing_map.device,
+            dtype=torch.int64,
+        ).expand(num_local_tokens, -1)
+        original_selected_ids = original_flat_ids[original_routing_map].reshape(
+            num_local_tokens, self.config.moe_router_topk
+        )
+        original_selected_ids = torch.sort(original_selected_ids, dim=-1).values
+        original_selected_probs = torch.gather(
+            original_probs, dim=-1, index=original_selected_ids
+        )
+
+        tp_slots = torch.arange(
+            self.tp_size, device=original_routing_map.device, dtype=torch.int64
+        )
+        original_ep = torch.div(
+            original_selected_ids, self.num_local_experts, rounding_mode="floor"
+        )
+        original_local_expert = torch.remainder(
+            original_selected_ids, self.num_local_experts
+        )
+        expected_expanded_ids = (
+            (original_ep.unsqueeze(-1) * self.tp_size + tp_slots.view(1, 1, -1))
+            * self.num_local_experts
+            + original_local_expert.unsqueeze(-1)
+        ).reshape(num_local_tokens, expected_expanded_routes)
+        expected_expanded_probs = (
+            original_selected_probs.unsqueeze(-1)
+            .expand(-1, -1, self.tp_size)
+            .reshape(num_local_tokens, expected_expanded_routes)
+        )
+
+        expanded_flat_ids = torch.arange(
+            expanded_routing_map.shape[-1],
+            device=expanded_routing_map.device,
+            dtype=torch.int64,
+        ).expand(num_local_tokens, -1)
+        actual_expanded_ids = expanded_flat_ids[expanded_routing_map].reshape(
+            num_local_tokens, expected_expanded_routes
+        )
+        actual_expanded_probs = torch.gather(
+            expanded_probs, dim=-1, index=actual_expanded_ids
+        )
+
+        if not torch.equal(actual_expanded_ids, expected_expanded_ids):
+            raise ValueError(
+                "pplx_garden TPxEP metadata expansion does not match the contiguous-per-rank "
+                f"expert layout expected by pplx. actual={actual_expanded_ids[:4].tolist()} "
+                f"expected={expected_expanded_ids[:4].tolist()}"
+            )
+        if not torch.equal(actual_expanded_probs, expected_expanded_probs):
+            raise ValueError(
+                "pplx_garden TPxEP probability expansion does not match expected TP replication. "
+                f"actual={actual_expanded_probs[:4].tolist()} "
+                f"expected={expected_expanded_probs[:4].tolist()}"
+            )
+
+        if _pplx_debug_enabled():
+            tp_ep_ranks = self._get_process_group_ranks(self.tp_ep_group)
+            tp_ranks = self._get_process_group_ranks(self.tp_group)
+            _pplx_debug_log(
+                "initialize metadata "
+                f"tp_rank={parallel_state.get_tensor_model_parallel_rank()} "
+                f"ep_rank={parallel_state.get_expert_model_parallel_rank()} "
+                f"tp_ep_rank={torch.distributed.get_group_rank(self.tp_ep_group, torch.distributed.get_rank())} "
+                f"tp_ep_ranks={tp_ep_ranks} tp_ranks={tp_ranks} "
+                f"local_expert_indices={self.local_expert_indices}"
+            )
+            _pplx_debug_log(
+                "initialize metadata samples "
+                f"original_selected_ids={original_selected_ids[:4].tolist()} "
+                f"expanded_selected_ids={actual_expanded_ids[:4].tolist()} "
+                f"owner_rank_hist={torch.bincount((actual_expanded_ids // self.num_local_experts).reshape(-1), minlength=self.tp_size * self.ep_size).tolist()}"
+            )
+
     def _initialize_metadata(
         self, routing_map: torch.Tensor, probs: torch.Tensor
     ) -> torch.Tensor:
@@ -1811,6 +1924,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         routing_map is replicated across TP group since each TP ranks in a TP group should
         receive the same tokens.
         """
+        original_routing_map = routing_map
+        original_probs = probs
         num_local_tokens = routing_map.shape[0]
         world_size = self.tp_size * self.ep_size
         # Organize routing map and probs to [num_local_tokens, world_size, num_local_experts]
@@ -1826,6 +1941,13 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             .expand(-1, -1, self.tp_size, -1)
             .reshape(num_local_tokens, world_size, self.num_local_experts)
         ).contiguous()
+        if self.config.moe_flex_dispatcher_backend == "pplx_garden":
+            self._validate_pplx_metadata_layout(
+                original_routing_map,
+                routing_map,
+                original_probs,
+                probs,
+            )
         return routing_map, probs
 
     @jit_fuser
