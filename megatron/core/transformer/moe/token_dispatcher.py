@@ -1434,15 +1434,23 @@ class _PplxGardenManager(_DispatchManager):
         self._dp_group_adapter = None
         self._node_group_adapter = None
         self._hidden_kernel = None
+        self._routing_map_kernel = None
+        self._prob_kernel = None
         self._kernel_config = None
         self._max_recv_tokens = None
         self._num_local_tokens = None
         self._dispatch_weights = None
+        self._local_expert_columns = None
 
         self.tokens_per_expert: Optional[torch.Tensor] = None
         self.token_probs: Optional[torch.Tensor] = None
         self.token_indices: Optional[torch.Tensor] = None
         self.dispatched_probs: Optional[torch.Tensor] = None
+        self.dispatched_routing_map: Optional[torch.Tensor] = None
+        self._expanded_sort_order: Optional[torch.Tensor] = None
+        self._expanded_unsort_order: Optional[torch.Tensor] = None
+        self._expanded_row_indices: Optional[torch.Tensor] = None
+        self._num_dispatched_rows: Optional[int] = None
 
         assert (
             self.num_experts
@@ -1462,6 +1470,12 @@ class _PplxGardenManager(_DispatchManager):
         if self._hidden_kernel is not None:
             self._hidden_kernel.destroy()
             self._hidden_kernel = None
+        if self._routing_map_kernel is not None:
+            self._routing_map_kernel.destroy()
+            self._routing_map_kernel = None
+        if self._prob_kernel is not None:
+            self._prob_kernel.destroy()
+            self._prob_kernel = None
         self._kernel_config = None
         self._max_recv_tokens = None
 
@@ -1527,9 +1541,23 @@ class _PplxGardenManager(_DispatchManager):
             out_dtype=hidden_dtype,
             **kernel_kwargs,
         )
+        self._routing_map_kernel = P2PAllToAll(
+            hidden_dim=self.num_experts,
+            in_dtype=torch.float32,
+            out_dtype=torch.float32,
+            **kernel_kwargs,
+        )
+        self._prob_kernel = P2PAllToAll(
+            hidden_dim=self.num_experts,
+            in_dtype=torch.float32,
+            out_dtype=torch.float32,
+            **kernel_kwargs,
+        )
         _pplx_debug_log(
             "ensure kernels end "
-            f"max_recv_tokens={self._max_recv_tokens} hidden_kernel_id={id(self._hidden_kernel)}"
+            f"max_recv_tokens={self._max_recv_tokens} hidden_kernel_id={id(self._hidden_kernel)} "
+            f"routing_map_kernel_id={id(self._routing_map_kernel)} "
+            f"prob_kernel_id={id(self._prob_kernel)}"
         )
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
@@ -1565,6 +1593,11 @@ class _PplxGardenManager(_DispatchManager):
             .reshape(num_tokens, self.router_topk)
             .to(torch.uint32)
         )
+        selected_probs = torch.gather(
+            probs,
+            dim=-1,
+            index=self.token_indices.to(torch.int64),
+        ).to(torch.float32)
         _pplx_debug_log(
             "setup metadata "
             f"routing_map_shape={tuple(routing_map.shape)} probs_shape={tuple(probs.shape)} "
@@ -1572,12 +1605,67 @@ class _PplxGardenManager(_DispatchManager):
             f"num_experts={self.num_experts} "
             f"token_indices_min={int(self.token_indices.min().item())} "
             f"token_indices_max={int(self.token_indices.max().item())} "
-            f"routes_per_token_unique={torch.unique(routes_per_token).tolist()}"
+            f"routes_per_token_unique={torch.unique(routes_per_token).tolist()} "
+            f"selected_probs_min={float(selected_probs.min().item()):.6f} "
+            f"selected_probs_max={float(selected_probs.max().item()):.6f}"
         )
         _pplx_debug_log(
             "setup metadata sample "
-            f"token_indices_sample={self.token_indices[:4].tolist()}"
+            f"token_indices_sample={self.token_indices[:4].tolist()} "
+            f"selected_probs_sample={selected_probs[:4].tolist()}"
         )
+
+        local_expert_start = self.rank * self.num_local_experts
+        self._local_expert_columns = [
+            local_expert_start + local_expert_idx
+            for local_expert_idx in range(self.num_local_experts)
+        ]
+
+    def _get_dispatched_local_tensor(
+        self, dispatched_tensor: torch.Tensor
+    ) -> torch.Tensor:
+        assert self._local_expert_columns is not None
+        return dispatched_tensor[:, self._local_expert_columns]
+
+    def _expand_and_sort_by_local_expert(
+        self,
+        hidden_states: torch.Tensor,
+        local_routing: torch.Tensor,
+        local_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        row_expert_counts = local_routing.sum(dim=-1)
+        if not torch.all(
+            (row_expert_counts >= 1) & (row_expert_counts <= self.router_topk)
+        ):
+            unique_counts = torch.unique(row_expert_counts).tolist()
+            raise ValueError(
+                "pplx_garden backend expects each dispatched row to map to between 1 and "
+                f"{self.router_topk} local experts, but saw local counts {unique_counts}"
+            )
+
+        expanded_row_indices, local_expert_index = local_routing.nonzero(as_tuple=True)
+        expanded_hidden = hidden_states[expanded_row_indices]
+        expanded_probs = local_probs[expanded_row_indices, local_expert_index]
+        self._num_dispatched_rows = hidden_states.shape[0]
+        self._expanded_row_indices = expanded_row_indices
+        self.tokens_per_expert = torch.bincount(
+            local_expert_index, minlength=self.num_local_experts
+        ).to(torch.long)
+        self._expanded_sort_order = torch.argsort(local_expert_index, stable=True)
+        self._expanded_unsort_order = torch.empty_like(self._expanded_sort_order)
+        self._expanded_unsort_order[self._expanded_sort_order] = torch.arange(
+            self._expanded_sort_order.numel(), device=self._expanded_sort_order.device
+        )
+
+        _pplx_debug_log(
+            "local expert expand/sort "
+            f"row_expert_counts_unique={torch.unique(row_expert_counts).tolist()} "
+            f"tokens_per_expert={self.tokens_per_expert.tolist()}"
+        )
+
+        return expanded_hidden[self._expanded_sort_order], expanded_probs[
+            self._expanded_sort_order
+        ]
 
     def dispatch(
         self,
@@ -1602,22 +1690,70 @@ class _PplxGardenManager(_DispatchManager):
             "dispatch hidden start "
             f"hidden_shape={tuple(hidden_states.shape)} hidden_dtype={hidden_states.dtype}"
         )
-        dispatched_hidden, tokens_per_expert, dispatched_probs = pplx_dispatch(
+        dispatched_hidden, tokens_per_expert, _ = pplx_dispatch(
             hidden_states,
             self.token_indices,
-            self.token_probs.gather(1, self.token_indices.long()).to(torch.float32),
+            self._dispatch_weights,
             self._hidden_kernel,
             self.num_local_experts,
             self._max_recv_tokens,
-            return_prob=True,
         )
         _pplx_debug_log(
             "dispatch hidden end "
             f"dispatched_hidden_shape={tuple(dispatched_hidden.shape)} "
             f"tokens_per_expert={tokens_per_expert.tolist()}"
         )
-        self.tokens_per_expert = tokens_per_expert.to(torch.long)
-        self.dispatched_probs = dispatched_probs
+        _pplx_debug_log(
+            "dispatch routing start "
+            f"routing_map_shape={tuple(self.token_probs.shape)} "
+            f"token_indices_shape={tuple(self.token_indices.shape)}"
+        )
+        dispatched_routing_matrix, _, _ = pplx_dispatch(
+            self.token_probs.new_zeros(self.token_probs.shape).scatter_(
+                1, self.token_indices.long(), 1.0
+            ),
+            self.token_indices,
+            self._dispatch_weights,
+            self._routing_map_kernel,
+            self.num_local_experts,
+            self._max_recv_tokens,
+        )
+        _pplx_debug_log(
+            "dispatch routing end "
+            f"dispatched_routing_matrix_shape={tuple(dispatched_routing_matrix.shape)}"
+        )
+        _pplx_debug_log(
+            "dispatch probs start "
+            f"token_probs_shape={tuple(self.token_probs.shape)} "
+            f"token_probs_dtype={self.token_probs.dtype}"
+        )
+        dispatched_prob_matrix, _, _ = pplx_dispatch(
+            self.token_probs.float(),
+            self.token_indices,
+            self._dispatch_weights,
+            self._prob_kernel,
+            self.num_local_experts,
+            self._max_recv_tokens,
+        )
+        _pplx_debug_log(
+            "dispatch probs end "
+            f"dispatched_prob_matrix_shape={tuple(dispatched_prob_matrix.shape)}"
+        )
+
+        del tokens_per_expert
+        self.dispatched_routing_map = self._get_dispatched_local_tensor(
+            dispatched_routing_matrix
+        ).bool()
+        dispatched_local_probs = self._get_dispatched_local_tensor(
+            dispatched_prob_matrix
+        )
+        dispatched_hidden, self.dispatched_probs = (
+            self._expand_and_sort_by_local_expert(
+                dispatched_hidden,
+                self.dispatched_routing_map,
+                dispatched_local_probs,
+            )
+        )
         _pplx_debug_log(
             "dispatch probs extracted "
             f"dispatched_probs_shape={tuple(self.dispatched_probs.shape)} "
@@ -1641,7 +1777,18 @@ class _PplxGardenManager(_DispatchManager):
     def get_restored_hidden_states_by_experts(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        return hidden_states
+        assert self._expanded_unsort_order is not None
+        assert self._expanded_row_indices is not None
+        assert self._num_dispatched_rows is not None
+
+        hidden_states = hidden_states[self._expanded_unsort_order]
+        restored_hidden = torch.zeros(
+            (self._num_dispatched_rows, hidden_states.shape[-1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        restored_hidden.index_add_(0, self._expanded_row_indices, hidden_states)
+        return restored_hidden
 
     def combine(
         self,
