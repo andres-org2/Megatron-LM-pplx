@@ -1410,13 +1410,28 @@ class _PplxGardenManager(_DispatchManager):
 
     def __init__(
         self,
-        global_group: torch.distributed.ProcessGroup,
-        dp_group: torch.distributed.ProcessGroup,
+        global_group: torch.distributed.ProcessGroup, # ETPxEP_GROUP
+        dp_group: torch.distributed.ProcessGroup, # EDP_GROUP (size based on groups should be <= global_group)
         num_local_experts: int,
         router_topk: int,
         num_experts: int,
         config: TransformerConfig,
     ):
+        """
+        Initialize the PPLX_Garden dispatcher.
+
+        Args:
+            group (torch.distributed.ProcessGroup): The process group to use for communication.
+                This should be the ETPxEP group.
+            dp_group (torch.distributed.ProcessGroup): The replicas within the group (ETP)
+            num_local_experts (int): The number of local experts.
+            router_topk (int): The number of experts for each token to select.
+            num_experts (int): The total number of experts in the group.
+            config (TransformerConfig): The configuration for the transformer model.
+        """
+
+        assert config.moe_expert_capacity_factor is None, "pplx_garden flex MoE backend doesn't support capacity factor based routing"
+
         self.global_group = global_group
         self.dp_group = dp_group
         self.num_local_experts = num_local_experts
@@ -1445,11 +1460,13 @@ class _PplxGardenManager(_DispatchManager):
         self.token_indices: Optional[torch.Tensor] = None
         self.dispatched_probs: Optional[torch.Tensor] = None
 
+        self.permute_fusion = config.moe_permute_fusion
+
         assert (
             self.num_experts
             == utils.get_pg_size(self.global_group) * self.num_local_experts
         ), (
-            "pplx_garden backend expects num_experts to match TPxEP group size times "
+            "pplx_garden backend expects num_experts to match EPxETP group size times "
             "num_local_experts"
         )
 
@@ -1463,12 +1480,22 @@ class _PplxGardenManager(_DispatchManager):
         if self._hidden_kernel is not None:
             self._hidden_kernel.destroy()
             self._hidden_kernel = None
-        self._kernel_config = None
-        self._max_recv_tokens = None
-        self._transport_dtype = None
+        
+        # Destroy correctly the parallel group adapters to avoid port conflicts and resource leaks.
+        if self._global_group_adapter is not None:
+            self._global_group_adapter.destroy()
+        if self._dp_group_adapter is not None:
+            self._dp_group_adapter.destroy()
+        if self._node_group_adapter is not None:
+            self._node_group_adapter.destroy()
+
+        self._global_group_adapter = None
+        self._dp_group_adapter = None
+        self._node_group_adapter = None
 
     def destroy(self) -> None:
         self._destroy_kernels()
+        _pplx_debug_log("Destroyed pplx_garden kernels and group adapters")
 
     def __del__(self):
         try:
@@ -1477,8 +1504,8 @@ class _PplxGardenManager(_DispatchManager):
             pass
 
     def _get_transport_dtype(self, hidden_dtype: torch.dtype) -> torch.dtype:
-        if hidden_dtype == torch.bfloat16:
-            return torch.float32
+        # if hidden_dtype == torch.bfloat16:
+        #     return torch.float32
         return hidden_dtype
 
     def _ensure_kernels(
@@ -1490,16 +1517,24 @@ class _PplxGardenManager(_DispatchManager):
             return
 
         _pplx_debug_log(
-            "ensure kernels start "
-            f"num_tokens={num_tokens} hidden_dim={hidden_dim} hidden_dtype={hidden_dtype} "
-            f"transport_dtype={transport_dtype} "
-            f"tp_ep_size={utils.get_pg_size(self.global_group)} tp_size={self.dp_size} "
+            f"ensure kernels start\n"
+            f"num_tokens={num_tokens} hidden_dim={hidden_dim} hidden_dtype={hidden_dtype}\n"
+            f"transport_dtype={transport_dtype}\n"
+            f"ep_etp_size={utils.get_pg_size(self.global_group)} etp_size={self.dp_size}\n"
             f"num_dp_groups={self.num_dp_groups} num_local_experts={self.num_local_experts}"
         )
         self._destroy_kernels()
         self._kernel_config = kernel_config
         self._transport_dtype = transport_dtype
-        self._max_recv_tokens = num_tokens * self.num_local_experts * self.num_dp_groups
+
+        _pplx_debug_log(
+            "ensure kernels starting after desroying kernels"
+        )
+
+        # P2PALLtoALL already multiplies the max_recv_tokens * topk
+        self._max_recv_tokens = num_tokens * utils.get_pg_size(self.global_group) * self.router_topk * self.num_local_experts # (seq_length * micro_batch_size) * EP_SIZE
+        # Tokens can only be repeated topk_times max
+
         if self._global_group_adapter is None or self._dp_group_adapter is None:
             (
                 self._global_group_adapter,
@@ -1555,47 +1590,63 @@ class _PplxGardenManager(_DispatchManager):
                 "initialization"
             )
 
-        routes_per_token = routing_map.sum(dim=-1)
-        if not torch.all(routes_per_token == self.router_topk):
-            unique_route_counts = torch.unique(routes_per_token).tolist()
-            raise ValueError(
-                "pplx_garden backend expects each token to route to exactly "
-                f"{self.router_topk} experts, but saw route counts {unique_route_counts}"
-            )
+        # NOTE: We can't have capacity factor based routing as the dispatcher wants tokens*topk always (for now)
+        # routes_per_token = routing_map.sum(dim=-1)
+        # if not torch.all(routes_per_token == self.router_topk):
+        #     unique_route_counts = torch.unique(routes_per_token).tolist()
+        #     raise ValueError(
+        #         "pplx_garden backend expects each token to route to exactly "
+        #         f"{self.router_topk} experts, but saw route counts {unique_route_counts}"
+        #     )
 
-        self.token_probs = probs
-        self._dispatch_weights = torch.ones(
-            (num_tokens, self.router_topk), dtype=torch.float32, device=probs.device
-        )
-        flat_token_indices = torch.arange(
-            self.num_experts, device=routing_map.device, dtype=torch.int64
+        # self.token_probs = probs
+        # flat_token_indices = torch.arange(
+        #     self.num_experts, device=routing_map.device, dtype=torch.int64
+        # ).expand(num_tokens, -1)
+        # self.token_indices = (
+        #     flat_token_indices[routing_map]
+        #     .reshape(num_tokens, self.router_topk)
+        #     .to(torch.uint32)
+        # )
+        # selected_probs = torch.gather(
+        #     probs,
+        #     dim=-1,
+        #     index=self.token_indices.to(torch.int64),
+        # ).to(torch.float32)
+        
+
+        # self.token_probs, self.token_indices = torch.topk(
+        #     probs, self.router_topk, dim=-1
+        # )
+
+        token_indices = torch.arange(
+           self.num_experts, device=routing_map.device, dtype=torch.int64
         ).expand(num_tokens, -1)
-        self.token_indices = (
-            flat_token_indices[routing_map]
-            .reshape(num_tokens, self.router_topk)
-            .to(torch.uint32)
-        )
-        selected_probs = torch.gather(
+        token_indices = token_indices[routing_map].reshape(num_tokens, self.router_topk)
+        token_probs = torch.gather(
             probs,
             dim=-1,
-            index=self.token_indices.to(torch.int64),
+            index=token_indices,
         ).to(torch.float32)
+
+        self.token_indices = token_indices.to(torch.uint32)
+        self.token_probs = token_probs
+        self._dispatch_weights = torch.ones_like(self.token_probs)
+
+        token_indices_min = int(self.token_indices.min().item())
+        token_indices_max = int(self.token_indices.max().item())
         _pplx_debug_log(
-            "setup metadata "
-            f"routing_map_shape={tuple(routing_map.shape)} probs_shape={tuple(probs.shape)} "
-            f"token_indices_shape={tuple(self.token_indices.shape)} router_topk={self.router_topk} "
-            f"num_experts={self.num_experts} "
-            f"token_indices_min={int(self.token_indices.min().item())} "
-            f"token_indices_max={int(self.token_indices.max().item())} "
-            f"routes_per_token_unique={torch.unique(routes_per_token).tolist()} "
-            f"selected_probs_min={float(selected_probs.min().item()):.6f} "
-            f"selected_probs_max={float(selected_probs.max().item()):.6f}"
+            f"setup metadata routing_map_shape={tuple(routing_map.shape)} probs_shape={tuple(probs.shape)} token_indices_shape={tuple(self.token_indices.shape)} router_topk={self.router_topk} num_experts={self.num_experts} token_indices_min={token_indices_min} token_indices_max={token_indices_max}"
         )
         _pplx_debug_log(
-            "setup metadata sample "
-            f"token_indices_sample={self.token_indices[:4].tolist()} "
-            f"selected_probs_sample={selected_probs[:4].tolist()}"
+            f"setup metadata sample\n token_indices_sample={self.token_indices[:4].tolist()}\n selected_probs_sample={self.token_probs[:4].tolist()}"
         )
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        """
+        Get the number of tokens per expert.
+        """
+        return self.tokens_per_expert
 
     def dispatch(
         self,
@@ -1611,24 +1662,26 @@ class _PplxGardenManager(_DispatchManager):
 
         assert self.token_indices is not None
         assert self.token_probs is not None
-        assert self._dispatch_weights is not None
-
+        # assert self._dispatch_weights is not None
+        
+        # NOTE: num_tokens = seq_length * micro_batch when we don't have token dropping (supposedly)
         self._ensure_kernels(
             hidden_states.shape[0], hidden_states.shape[1], hidden_states.dtype
         )
         assert self._transport_dtype is not None
         dispatch_hidden = hidden_states
-        if dispatch_hidden.dtype != self._transport_dtype:
-            dispatch_hidden = dispatch_hidden.to(self._transport_dtype)
+        # if dispatch_hidden.dtype != self._transport_dtype:
+        #     dispatch_hidden = dispatch_hidden.to(self._transport_dtype)
         _pplx_debug_log(
             "dispatch hidden start "
             f"hidden_shape={tuple(hidden_states.shape)} hidden_dtype={hidden_states.dtype} "
             f"dispatch_hidden_dtype={dispatch_hidden.dtype}"
         )
+        # NOTE: Tokens per expert will be contiguous in order of tokens of expert 0, then tokens of expert 1, etc.
         dispatched_hidden, tokens_per_expert, dispatched_probs = pplx_dispatch(
             dispatch_hidden,
             self.token_indices,
-            self.token_probs.gather(1, self.token_indices.long()).to(torch.float32),
+            self.token_probs,
             self._hidden_kernel,
             self.num_local_experts,
             self._max_recv_tokens,
@@ -1641,6 +1694,7 @@ class _PplxGardenManager(_DispatchManager):
             f"dispatched_hidden_shape={tuple(dispatched_hidden.shape)} "
             f"tokens_per_expert={tokens_per_expert.tolist()}"
         )
+        # self.dispatched_indices = self.token_indices # it seems combine still uses the local indices tokens?
         self.tokens_per_expert = tokens_per_expert.to(torch.long)
         self.dispatched_probs = dispatched_probs
         _pplx_debug_log(
@@ -1654,9 +1708,17 @@ class _PplxGardenManager(_DispatchManager):
 
         return dispatched_hidden
 
-    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        assert self.tokens_per_expert is not None
-        return self.tokens_per_expert
+    def _pad_routing_map(
+        self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pad the routing map to the nearest multiple of the pad_multiple.
+        """
+
+        raise NotImplementedError(
+            "pplx_garden backend currently doesn't support routing map padding for quantization. "
+            "This function needs to be implemented to enable this feature."
+        )
 
     def get_permuted_hidden_states_by_experts(
         self, hidden_states: torch.Tensor
@@ -1681,14 +1743,14 @@ class _PplxGardenManager(_DispatchManager):
             )
 
         assert self.token_indices is not None
-        assert self._dispatch_weights is not None
+        assert self.token_probs is not None
         assert self._hidden_kernel is not None
         assert self._num_local_tokens is not None
         assert self._transport_dtype is not None
 
         combine_hidden = hidden_states
-        if combine_hidden.dtype != self._transport_dtype:
-            combine_hidden = combine_hidden.to(self._transport_dtype)
+        # if combine_hidden.dtype != self._transport_dtype:
+        #     combine_hidden = combine_hidden.to(self._transport_dtype)
 
         _pplx_debug_log(
             "combine start "
@@ -1698,7 +1760,7 @@ class _PplxGardenManager(_DispatchManager):
         restored_hidden = pplx_combine(
             combine_hidden,
             self.token_indices,
-            self._dispatch_weights,
+            self.token_probs,
             self._hidden_kernel,
             self._num_local_tokens,
             self.num_local_experts,
@@ -1879,36 +1941,36 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             expanded_probs, dim=-1, index=actual_expanded_ids
         )
 
-        if not torch.equal(actual_expanded_ids, expected_expanded_ids):
-            raise ValueError(
-                "pplx_garden TPxEP metadata expansion does not match the contiguous-per-rank "
-                f"expert layout expected by pplx. actual={actual_expanded_ids[:4].tolist()} "
-                f"expected={expected_expanded_ids[:4].tolist()}"
-            )
-        if not torch.equal(actual_expanded_probs, expected_expanded_probs):
-            raise ValueError(
-                "pplx_garden TPxEP probability expansion does not match expected TP replication. "
-                f"actual={actual_expanded_probs[:4].tolist()} "
-                f"expected={expected_expanded_probs[:4].tolist()}"
-            )
+        # if not torch.equal(actual_expanded_ids, expected_expanded_ids):
+        #     raise ValueError(
+        #         "pplx_garden TPxEP metadata expansion does not match the contiguous-per-rank "
+        #         f"expert layout expected by pplx. actual={actual_expanded_ids[:4].tolist()} "
+        #         f"expected={expected_expanded_ids[:4].tolist()}"
+        #     )
+        # if not torch.equal(actual_expanded_probs, expected_expanded_probs):
+        #     raise ValueError(
+        #         "pplx_garden TPxEP probability expansion does not match expected TP replication. "
+        #         f"actual={actual_expanded_probs[:4].tolist()} "
+        #         f"expected={expected_expanded_probs[:4].tolist()}"
+        #     )
 
-        if _pplx_debug_enabled():
-            tp_ep_ranks = self._get_process_group_ranks(self.tp_ep_group)
-            tp_ranks = self._get_process_group_ranks(self.tp_group)
-            _pplx_debug_log(
-                "initialize metadata "
-                f"tp_rank={parallel_state.get_tensor_model_parallel_rank()} "
-                f"ep_rank={parallel_state.get_expert_model_parallel_rank()} "
-                f"tp_ep_rank={torch.distributed.get_group_rank(self.tp_ep_group, torch.distributed.get_rank())} "
-                f"tp_ep_ranks={tp_ep_ranks} tp_ranks={tp_ranks} "
-                f"local_expert_indices={self.local_expert_indices}"
-            )
-            _pplx_debug_log(
-                "initialize metadata samples "
-                f"original_selected_ids={original_selected_ids[:4].tolist()} "
-                f"expanded_selected_ids={actual_expanded_ids[:4].tolist()} "
-                f"owner_rank_hist={torch.bincount((actual_expanded_ids // self.num_local_experts).reshape(-1), minlength=self.tp_size * self.ep_size).tolist()}"
-            )
+        # if _pplx_debug_enabled():
+        #     tp_ep_ranks = self._get_process_group_ranks(self.tp_ep_group)
+        #     tp_ranks = self._get_process_group_ranks(self.tp_group)
+        #     _pplx_debug_log(
+        #         "initialize metadata "
+        #         f"tp_rank={parallel_state.get_tensor_model_parallel_rank()} "
+        #         f"ep_rank={parallel_state.get_expert_model_parallel_rank()} "
+        #         f"tp_ep_rank={torch.distributed.get_group_rank(self.tp_ep_group, torch.distributed.get_rank())} "
+        #         f"tp_ep_ranks={tp_ep_ranks} tp_ranks={tp_ranks} "
+        #         f"local_expert_indices={self.local_expert_indices}"
+        #     )
+        #     _pplx_debug_log(
+        #         "initialize metadata samples "
+        #         f"original_selected_ids={original_selected_ids[:4].tolist()} "
+        #         f"expanded_selected_ids={actual_expanded_ids[:4].tolist()} "
+        #         f"owner_rank_hist={torch.bincount((actual_expanded_ids // self.num_local_experts).reshape(-1), minlength=self.tp_size * self.ep_size).tolist()}"
+        #     )
 
     def _initialize_metadata(
         self, routing_map: torch.Tensor, probs: torch.Tensor

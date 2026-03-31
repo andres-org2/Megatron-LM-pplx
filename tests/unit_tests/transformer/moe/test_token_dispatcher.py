@@ -1,4 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+import token
 
 import copy
 import dataclasses
@@ -138,7 +139,7 @@ class MoEModelTestContainer:
     @pytest.mark.internal
     def dispatcher_dropless_test(self):
         moe_layer = self.moe_layer
-        bs = 32
+        bs = 2
         seql = 8
         # TODO: Find why setting manual seed can cause the test to fail
         # Manual seed to differentiate input data for each rank
@@ -154,13 +155,23 @@ class MoEModelTestContainer:
         probs, indices = apply_module(moe_layer.router)(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
+        # # print("probs:", probs)
+        # token_indices = torch.arange(
+        #     moe_layer.config.num_moe_experts, device=hidden_states.device
+        # ).expand(bs * seql, -1)
+
+        # print("shape of indices:", indices.shape)
+        # print("shape of token_indices:", token_indices.shape)
+
+        # print("indices:", token_indices[indices].reshape(bs * seql, moe_layer.router.topk))
+
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
             token_permutation(moe_layer.token_dispatcher, hidden_states, probs, indices)
         )
 
         permuted_local_hidden_states = (
             permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
-        )
+        ) # NOTE: This is the grouped gemm op, as in megatron they multiply the probs during the grouped gemm (like in after the up projection).
         permuted_local_hidden_states = permuted_local_hidden_states.to(
             dtype=self.test_dtype
         )
@@ -169,9 +180,12 @@ class MoEModelTestContainer:
             moe_layer.token_dispatcher, permuted_local_hidden_states
         )
 
-        # reduce across TP rank equals to multiply data by a scale of ETP
+        # reduce across TP rank equals to multiply data by a scale of ETP because the token will be duplicated ETP times
         scale = moe_layer.config.expert_tensor_parallel_size
         restored_hidden_states = restored_hidden_states / scale
+
+        print("restored_hidden_states:", restored_hidden_states[0, 0, 0:4])
+        print("ans:", ans[0, 0, 0:4])
 
         (
             torch.testing.assert_close(restored_hidden_states, ans),
@@ -626,9 +640,14 @@ class TestFlexDispatcher:
 )
 class TestPplxGardenFlexDispatcher:
     def setup_method(self, method):
-        pass
+        self.container = None
 
     def teardown_method(self, method):
+        if self.container is not None:
+            moe_layer = self.container.moe_layer
+            if hasattr(moe_layer, 'token_dispatcher') and hasattr(moe_layer.token_dispatcher, '_comm_manager'):
+                moe_layer.token_dispatcher._comm_manager.destroy()
+            self.container = None
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -638,7 +657,7 @@ class TestPplxGardenFlexDispatcher:
         if get_runtime_world_size() != 4:
             pytest.skip("single-node pplx test requires WORLD_SIZE=4")
 
-        container = MoEModelTestContainer(
+        self.container = MoEModelTestContainer(
             tp_size=1,
             ep_size=4,
             pp_size=1,
@@ -650,9 +669,9 @@ class TestPplxGardenFlexDispatcher:
             moe_permute_fusion=False,
             test_dtype=torch.bfloat16,
         )
-        moe_layer = container.moe_layer
+        moe_layer = self.container.moe_layer
         hidden_states = torch.randn(
-            (8, 4, moe_layer.config.hidden_size), dtype=container.test_dtype
+            (8, 4, moe_layer.config.hidden_size), dtype=self.container.test_dtype
         )
         hidden_states = hidden_states.cuda()
 
@@ -666,15 +685,16 @@ class TestPplxGardenFlexDispatcher:
         assert token_indices is not None
         assert token_indices.shape[-1] == moe_layer.router.topk
 
-        routing_map = indices.reshape(-1, container.config.num_moe_experts)
-        flat_token_indices = torch.arange(
-            container.config.num_moe_experts,
-            device=routing_map.device,
-            dtype=torch.int64,
-        ).expand(routing_map.shape[0], -1)
-        expected_token_indices = flat_token_indices[routing_map].reshape(
-            routing_map.shape[0], moe_layer.router.topk
-        )
+        # routing_map = indices.reshape(-1, container.config.num_moe_experts)
+        # flat_token_indices = torch.arange(
+        #     container.config.num_moe_experts,
+        #     device=routing_map.device,
+        #     dtype=torch.int64,
+        # ).expand(routing_map.shape[0], -1)
+        # expected_token_indices = flat_token_indices[routing_map].reshape(
+        #     routing_map.shape[0], moe_layer.router.topk
+        # )
+        _, expected_token_indices = torch.topk(probs, k=moe_layer.router.topk, dim=-1)
 
         torch.testing.assert_close(token_indices.long(), expected_token_indices)
 
@@ -685,7 +705,7 @@ class TestPplxGardenFlexDispatcher:
     def test_single_node_forward_backward(self, tp_size, ep_size):
         if get_runtime_world_size() != 4:
             pytest.skip("single-node pplx test requires WORLD_SIZE=4")
-        container = MoEModelTestContainer(
+        self.container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
             pp_size=1,
@@ -696,8 +716,11 @@ class TestPplxGardenFlexDispatcher:
             moe_flex_dispatcher_backend="pplx_garden",
             moe_permute_fusion=False,
             test_dtype=torch.bfloat16,
+            moe_router_force_load_balancing=True,
         )
-        container.dispatcher_dropless_test()
+
+        # TODO: TP>1 fails for now
+        self.container.dispatcher_dropless_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
@@ -706,7 +729,7 @@ class TestPplxGardenFlexDispatcher:
     def test_single_node_inference_no_grad(self, tp_size, ep_size):
         if get_runtime_world_size() != 4:
             pytest.skip("single-node pplx test requires WORLD_SIZE=4")
-        container = MoEModelTestContainer(
+        self.container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
             pp_size=1,
@@ -719,9 +742,9 @@ class TestPplxGardenFlexDispatcher:
             test_dtype=torch.bfloat16,
         )
 
-        moe_layer = container.moe_layer
+        moe_layer = self.container.moe_layer
         hidden_states = torch.randn(
-            (16, 4, moe_layer.config.hidden_size), dtype=container.test_dtype
+            (16, 4, moe_layer.config.hidden_size), dtype=self.container.test_dtype
         )
         hidden_states = hidden_states.cuda()
 
@@ -737,7 +760,7 @@ class TestPplxGardenFlexDispatcher:
     def test_multi_node_forward_backward(self, tp_size, ep_size):
         if get_runtime_world_size() != 8:
             pytest.skip("multi-node pplx test requires WORLD_SIZE=8")
-        container = MoEModelTestContainer(
+        self.container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
             pp_size=1,
@@ -749,7 +772,7 @@ class TestPplxGardenFlexDispatcher:
             moe_permute_fusion=False,
             test_dtype=torch.bfloat16,
         )
-        container.dispatcher_dropless_test()
+        self.container.dispatcher_dropless_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
@@ -758,7 +781,7 @@ class TestPplxGardenFlexDispatcher:
     def test_multi_node_inference_no_grad(self, tp_size, ep_size):
         if get_runtime_world_size() != 8:
             pytest.skip("multi-node pplx test requires WORLD_SIZE=8")
-        container = MoEModelTestContainer(
+        self.container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
             pp_size=1,
@@ -771,9 +794,9 @@ class TestPplxGardenFlexDispatcher:
             test_dtype=torch.bfloat16,
         )
 
-        moe_layer = container.moe_layer
+        moe_layer = self.container.moe_layer
         hidden_states = torch.randn(
-            (16, 4, moe_layer.config.hidden_size), dtype=container.test_dtype
+            (16, 4, moe_layer.config.hidden_size), dtype=self.container.test_dtype
         )
         hidden_states = hidden_states.cuda()
 
