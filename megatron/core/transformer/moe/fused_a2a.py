@@ -103,7 +103,8 @@ class _TorchProcessGroupAdapter(ParallelGroup):
 
         # Reuse the existing Megatron NCCL group; only create the Gloo cmd_group.
         self._device_group = device_group
-        
+        # self._device_group = _get_or_create_process_group(self._ranks, backend="nccl")
+
         _pplx_debug_log(
             f"Creating TorchProcessGroupAdapter cmd_group with device_group ranks {torch.distributed.get_process_group_ranks(self._device_group)} and node_meta {node_meta} and size {self._size}"
         )
@@ -477,33 +478,33 @@ def make_pplx_process_group_adapters(
     # if not ep_is_inter_node:
 
     node_group_adapter = None
-    if node_meta["num_nodes"] > 1:
-        node_device_group = None
-        current_rank = torch.distributed.get_rank()
-        for candidate_ranks in node_rank_groups:
-            # All ranks must participate in new_group; only keep ours.
-            candidate_device_group = _get_or_create_process_group(
-                candidate_ranks, backend="nccl"
-            )
-            if current_rank in candidate_ranks:
-                node_device_group = candidate_device_group
+    # if node_meta["num_nodes"] > 1:
+    #     node_device_group = None
+    #     current_rank = torch.distributed.get_rank()
+    #     for candidate_ranks in node_rank_groups:
+    #         # All ranks must participate in new_group; only keep ours.
+    #         candidate_device_group = _get_or_create_process_group(
+    #             candidate_ranks, backend="nccl"
+    #         )
+    #         if current_rank in candidate_ranks:
+    #             node_device_group = candidate_device_group
 
-        assert node_device_group is not None, (
-            "Failed to construct node-local pplx process group"
-        )
-        node_group_adapter = _TorchProcessGroupAdapter(
-            device_group=node_device_group,
-            ranks=node_ranks,
-            node_meta=node_meta,
-        )
-    else:
-        # NOTE: because the slice goes in order the ranks should be in the same node
-        gpus_per_node = torch.cuda.device_count()
-        # TODO: How do we do this reliably?
-        assert 0 < gpus_per_node <= min(8, global_group.size(), 8)
-        node_group_adapter = global_group_adapter.slice_by_count(
-            global_group_adapter._size // gpus_per_node
-        )
+    #     assert node_device_group is not None, (
+    #         "Failed to construct node-local pplx process group"
+    #     )
+    #     node_group_adapter = _TorchProcessGroupAdapter(
+    #         device_group=node_device_group,
+    #         ranks=node_ranks,
+    #         node_meta=node_meta,
+    #     )
+    # else:
+    #     # NOTE: because the slice goes in order the ranks should be in the same node
+    #     gpus_per_node = torch.cuda.device_count()
+    #     # TODO: How do we do this reliably?
+    #     assert 0 < gpus_per_node <= min(8, global_group.size(), 8)
+    #     node_group_adapter = global_group_adapter.slice_by_count(
+    #         global_group_adapter._size // gpus_per_node
+    #     )
 
     return global_group_adapter, dp_group_adapter, node_group_adapter
 
@@ -542,25 +543,63 @@ class PPLXDispatch(torch.autograd.Function):
             )
 
         # NOTE: out_expert_x will be contiguous in order of tokens of expert 0, then tokens of expert 1, etc.
+        _pplx_debug_log(f"dispatch x before dispatch:\n{x[:, 0].tolist()}")
         kernel.dispatch(
             out_expert_num_tokens=out_num_tokens,
             out_expert_x=out_x,
             out_expert_x_scale=None,
-            dp_x=x.contiguous(),
+            dp_x=x,
             dp_x_scale=None,
-            indices=token_indices.contiguous(),
-            weights=dispatch_weights.contiguous(),
+            indices=token_indices,
+            weights=dispatch_weights,
             out_expert_prob=out_prob,
+            bound_m=None,
+            do_send=True,
+            do_recv=False,
         )
+        torch.cuda.synchronize()
+        kernel.dispatch(
+            out_expert_num_tokens=out_num_tokens,
+            out_expert_x=out_x,
+            out_expert_x_scale=None,
+            dp_x=x,
+            dp_x_scale=None,
+            indices=token_indices,
+            weights=dispatch_weights,
+            out_expert_prob=out_prob,
+            bound_m=None,
+            do_send=False,
+            do_recv=True,
+        )
+        torch.cuda.synchronize()
         num_recv_tokens = int(out_num_tokens.sum().item())
         _pplx_debug_log(
             "dispatch forward end "
             f"num_recv_tokens={num_recv_tokens} tokens_per_expert={out_num_tokens.tolist()} out_x.shape={out_x.shape}"
         )
+        _pplx_debug_log(f"dispatch forward end out_x tokens:\n{out_x[:num_recv_tokens, 0].tolist()}")
+
+        # Debugging
+        tokens_mine_to_recv = (token_indices.reshape(-1).to(torch.int64) < num_local_experts).sum().item()
+        tokens_mine_to_recv_no_topk = (token_indices.to(torch.int64) < num_local_experts).any(dim=1).sum().item()
+        # recv_tokens_mine = 0
+        # if num_recv_tokens > 0 and x.shape[0] > 0:
+        #     x_first = x[:, 0].cpu()
+        #     out_x_first = out_x[:num_recv_tokens, 0].cpu()
+        #     for i in x_first.tolist():
+        #         for j in out_x_first.tolist():
+        #             if i == j:
+        #                 recv_tokens_mine += 1
+        _pplx_debug_log(f"tokens_mine_to_recv={tokens_mine_to_recv}")
+        _pplx_debug_log(f"tokens_mine_to_recv_no_topk={tokens_mine_to_recv_no_topk}")
+
         ctx.kernel = kernel
         ctx.num_input_tokens = x.shape[0]
         ctx.num_local_experts = num_local_experts
         ctx.save_for_backward(token_indices, torch.ones_like(dispatch_weights))
+        # if out_prob is None:
+        #     return out_x[:num_recv_tokens], out_num_tokens, None
+        # return out_x[:num_recv_tokens], out_num_tokens, out_prob[:num_recv_tokens]
         if out_prob is None:
             return out_x, out_num_tokens, None
         return out_x, out_num_tokens, out_prob
@@ -581,9 +620,9 @@ class PPLXDispatch(torch.autograd.Function):
         )
         ctx.kernel.combine(
             out_tokens=grad_x,
-            indices=token_indices.contiguous(),
+            indices=token_indices,
             weights=torch.ones_like(dispatch_weights), # NOTE: we need to pass ones here as the combine kernel always multiply the hidden states with the weights.
-            expert_y=grad_output.contiguous(),
+            expert_y=grad_output,
         )
         torch.cuda.synchronize()
     
@@ -601,21 +640,50 @@ class PPLXCombine(torch.autograd.Function):
         _pplx_debug_log(
             "combine forward start "
             f"x_shape={tuple(x.shape)} x_dtype={x.dtype} x_stride={tuple(x.stride())} "
-            f"indices_shape={tuple(token_indices.shape)} indices_dtype={token_indices.dtype} "
+            f"indices_shape={tuple(token_indices.shape)} indices_dtype={token_indices.dtype} indices={token_indices.tolist()} "
             f"weights_shape={tuple(combine_weights.shape)} weights_dtype={combine_weights.dtype} "
-            f"num_tokens={num_tokens} num_local_experts={num_local_experts}"
+            f"num_tokens={num_tokens} num_local_experts={num_local_experts} "
         )
         out_tokens = torch.empty(
             (num_tokens, x.shape[1]), dtype=x.dtype, device=x.device
         )
+        rank = torch.distributed.get_rank()
+
+        _pplx_debug_log(f"combine expert_y before combine:\n{x[:8, :8].tolist()}")
         kernel.combine(
             out_tokens=out_tokens,
-            indices=token_indices.contiguous(),
+            indices=token_indices,
             weights=torch.ones_like(combine_weights), # NOTE: we need to pass ones here as the combine kernel always multiply the hidden states with the weights.
-            expert_y=x.contiguous(),
+            expert_y=x,
             accumulate=False, # NOTE: accumulate seems to be for when our out_tokens tensor already contains values and we want to add the expert results on top of it.
+            do_send=True,
+            do_recv=False,
+        )
+        torch.cuda.synchronize()
+        recv_buf = kernel._recv_buffer_mapping.to_tensor(
+            (kernel._recv_buffer_mapping.size,), torch.uint8
+        ).cpu()
+        # view as the output dtype to see actual values
+        hidden_dim = kernel._hidden_dim
+        out_dtype = kernel._out_dtype
+        token_dim = ((hidden_dim * out_dtype.itemsize + 15) // 16) * 16
+        num_slots = kernel._recv_buffer_mapping.size // token_dim
+        data = recv_buf[:num_slots * token_dim].view(out_dtype).reshape(num_slots, -1)
+        _pplx_debug_log(f"combine recv buffer first 8 slots:\n{data[:8, :8].tolist()}")
+
+        kernel.combine(
+            out_tokens=out_tokens,
+            indices=token_indices,
+            weights=torch.ones_like(
+                combine_weights
+            ),  # NOTE: we need to pass ones here as the combine kernel always multiply the hidden states with the weights.
+            expert_y=x,
+            accumulate=False,  # NOTE: accumulate seems to be for when our out_tokens tensor already contains values and we want to add the expert results on top of it.
+            do_send=False,
+            do_recv=True,
         )
         torch.cuda.synchronize() 
+
         _pplx_debug_log("combine forward end")
         ctx.kernel = kernel
         ctx.num_local_experts = num_local_experts
@@ -642,10 +710,10 @@ class PPLXCombine(torch.autograd.Function):
             out_expert_num_tokens=out_num_tokens,
             out_expert_x=out_x,
             out_expert_x_scale=None,
-            dp_x=grad_output.contiguous(),
+            dp_x=grad_output,
             dp_x_scale=None,
-            indices=token_indices.contiguous(),
-            weights=combine_weights.contiguous(), # NOTE: it will not be dispatched as we aren't allocating for the out_expert_probs
+            indices=token_indices,
+            weights=combine_weights, # NOTE: it will not be dispatched as we aren't allocating for the out_expert_probs
         )
         num_recv_tokens = int(out_num_tokens.sum().item())
         _pplx_debug_log(
