@@ -13,7 +13,8 @@ export RUST_LOG=debug
 export PPLX_DEBUG_SYNC_DISPATCH_SEND=1
 export PPLX_DEBUG_LAUNCHER_DISPATCH_SEND=1
 export PPLX_DEBUG_SKIP_PADDED_INDEX_COPY=0
-export PPLX_DEBUG_PADDED_INDEX_FILL=123
+# export PPLX_DEBUG_PADDED_INDEX_FILL=1
+unset PPLX_DEBUG_PADDED_INDEX_FILL
 
 # export NCCL_DEBUG=TRACE
 # export TORCH_CPP_LOG_LEVEL=INFO
@@ -33,8 +34,8 @@ export PPLX_DEBUG_PADDED_INDEX_FILL=123
 #     -k "TestPplxGardenFlexDispatcher" \
 #     -v
 
-export CUDA_VISIBLE_DEVICES=0,1
-NUMBER_OF_GPUS_PER_NODE=2
+# export CUDA_VISIBLE_DEVICES=0,1
+NUMBER_OF_GPUS_PER_NODE=4
 
 if [ "${DEBUG:-0}" = "1" ]; then
     echo "Running in debug mode with debugpy"
@@ -60,5 +61,6 @@ else
         --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" \
         -m pytest \
         tests/unit_tests/transformer/moe/test_token_dispatcher.py::TestPplxGardenFlexDispatcher::test_single_node_forward_backward \
-        -v
+        -v \
+        # -k "test_single_node_forward_backward[128-8-1-4]"
 fi
